@@ -1,0 +1,20 @@
+# CardPass — dependencies
+# The native macOS app (main.m + pcsc_reader.c) has *no* pip dependencies.
+# It only needs Xcode Command Line Tools and the system PCSC.framework:
+#   xcode-select --install
+# Build: clang -fobjc-arc -framework Cocoa -framework CoreGraphics -framework ApplicationServices -framework PCSC main.m pcsc_reader.c -o CardPass
+#
+# The files in deprecated/ are a legacy Python reference. Install only if you
+# want to run the old Python demos:
+#
+#   pip install -r requirements.txt
+#
+# pyscard is LGPL-2.1; pyperclip/rumps/pyautogui are BSD — see THIRD_PARTY_NOTICES.md
+
+# Legacy Python demo (deprecated/)
+pyscard==2.3.1       # smartcard bindings — LGPL-2.1
+pyperclip==1.11.0    # clipboard — BSD-3-Clause
+# The following are *only* for the deprecated demos; uncomment if needed:
+# rumps==0.4.0       # macOS menu bar helper — BSD-2-Clause
+# pyautogui==0.9.54  # auto-type — BSD-3-Clause
+# py2app==0.28.6     # bundling — MIT

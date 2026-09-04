@@ -1,0 +1,57 @@
+# CardPass — gitignore
+# Do not upload: secrets, session, system files, build artifacts
+
+# Build outputs
+CardPass
+*.o
+*.dSYM/
+*.app/
+*.dmg
+*.pkg
+build/
+dist/
+DerivedData/
+
+# Python legacy / caches
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+pip-log.txt
+
+# macOS system
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+
+# Xcode / tooling
+*.xcuserstate
+project.xcworkspace/
+xcuserdata/
+.swiftpm/
+*.xcodeproj/*
+
+# Agents / sessions — never publish (per maintainer instructions)
+AGENTS.md
+sessions*.md
+session*.md
+scratch*.md
+FIX_SUMMARY.md
+
+# Deprecated local reference (kept locally, not published)
+deprecated/
+
+# Private notes
+*.key
+*.pem
+*.env
+*.secret
+
+# Library central copy — not part of repo
+# /Volumes/Mac Stick/Library/CardPass is outside the repo by design
