@@ -381,10 +381,21 @@ typedef NS_ENUM(NSInteger, CPEncoding) {
     CPEncodingBase62 = 1,
     CPEncodingBase58 = 2,
     CPEncodingBase64 = 3,
+    CPEncodingBase32 = 4, // RFC4648 A-Z2-7=
+    CPEncodingBase36 = 5, // 0-9A-Z
+};
+
+typedef NS_ENUM(NSInteger, CPHash) {
+    CPHashNone = 0,
+    CPHashSHA256 = 1,
+    CPHashSHA512 = 2,
+    CPHashSHA1 = 3,
+    CPHashMD5 = 4,
 };
 
 static NSString *alphabetBase62(void) { return @"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"; }
 static NSString *alphabetBase58(void) { return @"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"; }
+static NSString *alphabetBase36(void) { return @"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; }
 
 /** Convert hex string (e.g. "0A1B") to NSData. Ignores whitespace. Returns nil on invalid hex. */
 static NSData *dataFromHexString(NSString *hex) {
@@ -465,6 +476,35 @@ static NSString *baseEncodeData(NSData *data, NSString *alphabet) {
 
 static NSString *base62EncodeData(NSData *data) { return baseEncodeData(data, alphabetBase62()); }
 static NSString *base58EncodeData(NSData *data) { return baseEncodeData(data, alphabetBase58()); }
+static NSString *base36EncodeData(NSData *data) { return baseEncodeData(data, alphabetBase36()); }
+static NSString *base32EncodeData(NSData *data) {
+    if (!data || data.length==0) return @"";
+    // RFC4648 Base32 without padding, then add padding to multiple of 8
+    NSString *b64 = [data base64EncodedStringWithOptions:0];
+    // Use NSData base32 via custom? Simpler: use known Base32 alphabet via manual
+    // For now, use base64 then convert via table is complex; instead do direct Base32
+    static const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    NSMutableString *result = [NSMutableString string];
+    const uint8_t *bytes = data.bytes;
+    NSUInteger len = data.length;
+    int buffer = 0, bitsLeft = 0;
+    for (NSUInteger i=0;i<len;i++) {
+        buffer = (buffer << 8) | bytes[i];
+        bitsLeft += 8;
+        while (bitsLeft >= 5) {
+            bitsLeft -= 5;
+            int index = (buffer >> bitsLeft) & 0x1F;
+            [result appendFormat:@"%c", alphabet[index]];
+        }
+    }
+    if (bitsLeft > 0) {
+        int index = (buffer << (5 - bitsLeft)) & 0x1F;
+        [result appendFormat:@"%c", alphabet[index]];
+    }
+    // Pad to multiple of 8 with =
+    while (result.length % 8 != 0) [result appendString:@"="];
+    return result;
+}
 static NSString *base64EncodeData(NSData *data) { return [data base64EncodedStringWithOptions:0]; }
 
 static NSData *sha256Data(NSData *data) {
@@ -473,17 +513,37 @@ static NSData *sha256Data(NSData *data) {
     CC_SHA256(data.bytes, (CC_LONG)data.length, hash);
     return [NSData dataWithBytes:hash length:CC_SHA256_DIGEST_LENGTH];
 }
+static NSData *hashData(NSData *data, CPHash hash) {
+    if (!data) return nil;
+    if (hash == CPHashSHA256) return sha256Data(data);
+    if (hash == CPHashSHA512) {
+        unsigned char h[CC_SHA512_DIGEST_LENGTH];
+        CC_SHA512(data.bytes, (CC_LONG)data.length, h);
+        return [NSData dataWithBytes:h length:CC_SHA512_DIGEST_LENGTH];
+    }
+    if (hash == CPHashSHA1) {
+        unsigned char h[CC_SHA1_DIGEST_LENGTH];
+        CC_SHA1(data.bytes, (CC_LONG)data.length, h);
+        return [NSData dataWithBytes:h length:CC_SHA1_DIGEST_LENGTH];
+    }
+    if (hash == CPHashMD5) {
+        unsigned char h[CC_MD5_DIGEST_LENGTH];
+        CC_MD5(data.bytes, (CC_LONG)data.length, h);
+        return [NSData dataWithBytes:h length:CC_MD5_DIGEST_LENGTH];
+    }
+    return data; // None
+}
 
-/** Core transform: raw bytes -> (hash? SHA256 : raw) -> encode -> truncate.
- *  - encoding: Hex/Base62/Base58/Base64
- *  - hash: if YES, SHA256 first (32 bytes -> e.g. Base62 43 chars)
+/** Core transform: raw bytes -> (hash? -> raw) -> encode -> truncate.
+ *  - encoding: Hex/Base62/Base58/Base64/Base32/Base36
+ *  - hash: CPHashNone or SHA256/SHA512/SHA1/MD5
  *  - truncate: 0 = no truncation, else limit to N characters (clipped if shorter)
  */
-static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NSInteger truncate) {
+static NSString *transformData(NSData *raw, CPEncoding encoding, CPHash hash, NSInteger truncate) {
     if (!raw) return @"";
     NSData *src = raw;
-    if (doHash) {
-        src = sha256Data(raw);
+    if (hash != CPHashNone) {
+        src = hashData(raw, hash);
         if (!src) return @"";
     }
     NSString *encoded = @"";
@@ -491,6 +551,8 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
         case CPEncodingBase62: encoded = base62EncodeData(src); break;
         case CPEncodingBase58: encoded = base58EncodeData(src); break;
         case CPEncodingBase64: encoded = base64EncodeData(src); break;
+        case CPEncodingBase32: encoded = base32EncodeData(src); break;
+        case CPEncodingBase36: encoded = base36EncodeData(src); break;
         case CPEncodingHex:
         default: {
             NSMutableString *hex = [NSMutableString stringWithCapacity:src.length*2];
@@ -504,6 +566,10 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
         return [encoded substringToIndex:truncate];
     }
     return encoded;
+}
+// Backwards compat for BOOL doHash (SHA256)
+static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash, NSInteger trunc) {
+    return transformData(raw, enc, doHash ? CPHashSHA256 : CPHashNone, trunc);
 }
 
 /**
@@ -541,10 +607,12 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 // Raw bytes + transformed password handling
 @property (strong, nonatomic) NSData *lastRawData;
 @property (assign, nonatomic) CPEncoding selectedEncoding;
-@property (assign, nonatomic) BOOL hashEnabled;
+@property (assign, nonatomic) CPHash selectedHash;
+@property (assign, nonatomic) BOOL hashEnabled; // kept for backwards compat, maps to selectedHash != None
 @property (assign, nonatomic) NSInteger truncateLength;
 @property (strong, nonatomic) NSPopUpButton *encodingPopup;
-@property (strong, nonatomic) NSButton *hashCheck;
+@property (strong, nonatomic) NSPopUpButton *hashPopup;
+@property (strong, nonatomic) NSButton *hashCheck; // legacy, hidden
 @property (strong, nonatomic) NSTextField *truncateField;
 @property (strong, nonatomic) NSStepper *truncateStepper;
 @property (strong, nonatomic) NSTextField *encodingInfoLabel;
@@ -555,6 +623,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 // Custom text per card (user can set any text to paste instead of card data)
 @property (strong, nonatomic) NSMutableDictionary<NSString*, NSString*> *customMappings;
 @property (copy, nonatomic) NSString *currentCardId;
+@property (strong, nonatomic) NSRunningApplication *lastFrontmostApp;
 // Advanced pane — separate window that slides out to the right (per spec: not just expanding fields)
 @property (strong, nonatomic) NSWindow *advancedWindow;
 @property (strong, nonatomic) NSView *advancedPane;
@@ -580,6 +649,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 - (void)checkAccessibility:(id)sender;
 - (void)openBuyMeACoffee:(id)sender;
 - (void)showRawHexPanel:(id)sender;
+- (void)frontmostAppChanged:(NSNotification *)note;
 - (void)encodingChanged:(id)sender;
 - (void)hashToggled:(id)sender;
 - (void)truncateChanged:(id)sender;
@@ -606,14 +676,23 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     _truncateLength = 0; // 0 = no truncation
     _autoTypeDelay = 1.0;
     _advancedVisible = NO;
+    _lastFrontmostApp = nil;
     // Restore user prefs if any
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     _customMappings = [[defaults dictionaryForKey:@"CPCustomMappings"] mutableCopy];
     if (!_customMappings) _customMappings = [NSMutableDictionary dictionary];
     _currentCardId = nil;
     NSInteger savedEnc = [defaults integerForKey:@"CPEncoding"];
-    if (savedEnc >= 0 && savedEnc <= 3) _selectedEncoding = (CPEncoding)savedEnc;
-    _hashEnabled = [defaults boolForKey:@"CPHashEnabled"];
+    if (savedEnc >= 0 && savedEnc <= 5) _selectedEncoding = (CPEncoding)savedEnc;
+    NSInteger savedHash = [defaults integerForKey:@"CPHash"];
+    if (savedHash >= 0 && savedHash <= 4) _selectedHash = (CPHash)savedHash;
+    else {
+        // Backwards compat: old BOOL CPHashEnabled -> SHA256
+        _hashEnabled = [defaults boolForKey:@"CPHashEnabled"];
+        _selectedHash = _hashEnabled ? CPHashSHA256 : CPHashNone;
+    }
+    // Keep BOOL in sync
+    _hashEnabled = (_selectedHash != CPHashNone);
     _truncateLength = [defaults integerForKey:@"CPTruncateLength"];
     if (_truncateLength < 0) _truncateLength = 0;
     if (_truncateLength > 128) _truncateLength = 128;
@@ -623,6 +702,15 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp activateIgnoringOtherApps:YES];
+
+    // Track last frontmost app that is not CardPass, for auto-paste target
+    [[NSWorkspace sharedWorkspace] notificationCenter];
+    [[[NSWorkspace sharedWorkspace] notificationCenter] addObserver:self selector:@selector(frontmostAppChanged:) name:NSWorkspaceDidActivateApplicationNotification object:nil];
+    // Initialize with current frontmost if not CardPass
+    NSRunningApplication *cur = [[NSWorkspace sharedWorkspace] frontmostApplication];
+    if (cur && ![cur.bundleIdentifier isEqualToString:@"com.cardpass.app"]) {
+        self.lastFrontmostApp = cur;
+    }
 
     pcsc_init();
 
@@ -861,31 +949,52 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     encLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:encLabel];
 
-    self.encodingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(70, 260, 140, 24) pullsDown:NO];
-    [self.encodingPopup addItemsWithTitles:@[@"Hex (Base16)", @"Base62 (A-Za-z0-9)", @"Base58 (no 0/O/I/l)", @"Base64 (+/ with =)"]];
+    self.encodingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(70, 260, 120, 24) pullsDown:NO];
+    [self.encodingPopup addItemsWithTitles:@[@"Hex (Base16)", @"Base62 (A-Z0-9)", @"Base58 (no 0/O/I/l)", @"Base64 (+/)", @"Base32 (A-Z2-7)", @"Base36 (0-9A-Z)"]];
     [self.encodingPopup selectItemAtIndex:self.selectedEncoding];
     self.encodingPopup.target = self;
     self.encodingPopup.action = @selector(encodingChanged:);
-    self.encodingPopup.toolTip = @"Base62 recommended: alphanumeric only, ~30% shorter than hex. Base58 ideal for human transcription.";
+    self.encodingPopup.toolTip = @"Base62 recommended: alphanumeric only, ~30% shorter than hex. Base58 ideal for human transcription. Base32/Base36 add more options.";
     self.encodingPopup.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.encodingPopup];
 
+    // Hash popup: None / SHA-256 / SHA-512 / SHA1 / MD5
+    NSTextField *hashLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(200, 265, 32, 14)];
+    hashLabel.stringValue = @"Hash:";
+    hashLabel.font = [NSFont systemFontOfSize:11];
+    hashLabel.textColor = [NSColor secondaryLabelColor];
+    hashLabel.bezeled = NO; hashLabel.drawsBackground = NO; hashLabel.editable = NO; hashLabel.selectable = NO;
+    hashLabel.autoresizingMask = NSViewMaxYMargin;
+    [content addSubview:hashLabel];
+
+    self.hashPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(232, 260, 110, 24) pullsDown:NO];
+    [self.hashPopup addItemsWithTitles:@[@"None", @"SHA-256", @"SHA-512", @"SHA-1", @"MD5"]];
+    NSInteger hashIdx = 0;
+    if (self.selectedHash == CPHashSHA256) hashIdx = 1;
+    else if (self.selectedHash == CPHashSHA512) hashIdx = 2;
+    else if (self.selectedHash == CPHashSHA1) hashIdx = 3;
+    else if (self.selectedHash == CPHashMD5) hashIdx = 4;
+    [self.hashPopup selectItemAtIndex:hashIdx];
+    self.hashPopup.target = self;
+    self.hashPopup.action = @selector(hashChanged:);
+    self.hashPopup.toolTip = @"Hash raw bytes before encoding. SHA-256 → 32 bytes (Base62 43 chars), SHA-512 → 64 bytes, etc. Use for massive card data or fixed-length passwords.";
+    self.hashPopup.autoresizingMask = NSViewMaxYMargin;
+    [content addSubview:self.hashPopup];
+
+    // Keep old checkbox hidden for backwards compat (not used, but keep property)
     self.hashCheck = [[NSButton alloc] initWithFrame:NSMakeRect(220, 265, 110, 18)];
     [self.hashCheck setButtonType:NSButtonTypeSwitch];
     self.hashCheck.title = @"Hash SHA-256";
+    self.hashCheck.hidden = YES;
     self.hashCheck.state = self.hashEnabled ? NSControlStateValueOn : NSControlStateValueOff;
-    self.hashCheck.font = [NSFont systemFontOfSize:11];
-    self.hashCheck.target = self;
-    self.hashCheck.action = @selector(hashToggled:);
-    self.hashCheck.toolTip = @"Hash raw bytes with SHA-256 then encode → always 32 bytes (Base62 43 chars). Use for massive card data or fixed-length passwords.";
-    self.hashCheck.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.hashCheck];
 
-    NSTextField *truncLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(340, 265, 42, 14)];
+    NSTextField *truncLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(330, 265, 52, 14)];
     truncLabel.stringValue = @"Truncate:";
     truncLabel.font = [NSFont systemFontOfSize:11];
     truncLabel.textColor = [NSColor secondaryLabelColor];
     truncLabel.bezeled = NO; truncLabel.drawsBackground = NO; truncLabel.editable = NO; truncLabel.selectable = NO;
+    truncLabel.alignment = NSTextAlignmentRight;
     truncLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:truncLabel];
 
@@ -1582,14 +1691,45 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
                       v;
                   }), AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{(__bridge id)kAXTrustedCheckOptionPrompt:@NO}));
 
+            // Use the last frontmost app that was not CardPass (tracked via NSWorkspaceDidActivateApplicationNotification)
+            NSRunningApplication *prevFront = self.lastFrontmostApp;
+            if (!prevFront || [prevFront.bundleIdentifier isEqualToString:@"com.cardpass.app"] || prevFront.isTerminated) {
+                prevFront = [[NSWorkspace sharedWorkspace] frontmostApplication];
+                if ([prevFront.bundleIdentifier isEqualToString:@"com.cardpass.app"]) {
+                    // Fallback: find any regular app
+                    for (NSRunningApplication *app in [[NSWorkspace sharedWorkspace] runningApplications]) {
+                        if (![app.bundleIdentifier isEqualToString:@"com.cardpass.app"] && app.activationPolicy == NSApplicationActivationPolicyRegular && !app.isHidden) {
+                            prevFront = app;
+                            break;
+                        }
+                    }
+                }
+            }
+
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(self.autoTypeDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 if (!self.lastHex || self.lastHex.length==0) return;
                 NSString *toPaste = [self effectivePasteString];
                 if (!toPaste || toPaste.length==0) toPaste = [self currentTransformedString];
                 if (!toPaste || toPaste.length==0) toPaste = self.lastHex;
-                NSLog(@"Auto-type attempting robust paste for %lu chars (custom:%@)", (unsigned long)toPaste.length, [self customTextForCardId:self.currentCardId] ? @"YES" : @"NO");
-                // typeString now tries AX → Cmd+V → AppleScript → per-char without pre-check
-                typeString([toPaste UTF8String]);
+                NSLog(@"Auto-type attempting robust paste for %lu chars (custom:%@) to front app %@", (unsigned long)toPaste.length, [self customTextForCardId:self.currentCardId] ? @"YES" : @"NO", prevFront.localizedName ?: @"unknown");
+                // Hide CardPass briefly so the target field regains focus, then paste
+                BOOL wasVisible = self.mainWindow.isVisible;
+                if (wasVisible) [self.mainWindow orderOut:nil];
+                // Also ensure pasteboard is set
+                copyToClipboard([toPaste UTF8String]);
+                // Give system time to focus previous app
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    // Try to activate the previous frontmost app
+                    if (prevFront) [prevFront activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+                    usleep(200000);
+                    typeString([toPaste UTF8String]);
+                    // Restore CardPass window if it was visible
+                    if (wasVisible) {
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                            [self.mainWindow makeKeyAndOrderFront:nil];
+                        });
+                    }
+                });
                 // Assume paste was attempted; show success and return to Ready.
                 // If the user sees nothing pasted, they can still press ⌘V (clipboard is set).
                 self.statusLabel.stringValue = @"Ready — pasted (or press ⌘V) ✓";
@@ -1670,16 +1810,54 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     NSLog(@"Manual Type pressed for %lu chars (custom:%@), attempting robust paste", (unsigned long)toPaste.length, [self customTextForCardId:self.currentCardId] ? @"YES" : @"NO");
     // Ensure clipboard has the latest effective value
     copyToClipboard([toPaste UTF8String]);
+    // Use lastFrontmostApp for target, fallback to current frontmost
+    NSRunningApplication *prevFront = self.lastFrontmostApp;
+    if (!prevFront || [prevFront.bundleIdentifier isEqualToString:@"com.cardpass.app"] || prevFront.isTerminated) {
+        prevFront = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if ([prevFront.bundleIdentifier isEqualToString:@"com.cardpass.app"]) {
+            for (NSRunningApplication *app in [[NSWorkspace sharedWorkspace] runningApplications]) {
+                if (![app.bundleIdentifier isEqualToString:@"com.cardpass.app"] && app.activationPolicy == NSApplicationActivationPolicyRegular && !app.isHidden) {
+                    prevFront = app;
+                    break;
+                }
+            }
+        }
+    }
+    NSLog(@"Manual Type: will paste to %@ (pid %d) after hiding CardPass", prevFront.localizedName ?: @"unknown", prevFront.processIdentifier);
     self.statusLabel.stringValue = @"Typing...";
     self.statusLabel.textColor = [NSColor systemBlueColor];
     if (self.statusButton) self.statusButton.title = @" Typing...";
-    __weak typeof(self) weakSelf = self;
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        // Use toPaste captured strongly for this attempt
+    BOOL wasVisible = self.mainWindow.isVisible;
+    if (wasVisible) [self.mainWindow orderOut:nil];
+    BOOL advWasVisible = self.advancedWindow.isVisible;
+    if (advWasVisible) [self.advancedWindow orderOut:nil];
+    // Give system time to focus previous app, then paste
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (prevFront) [prevFront activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+        usleep(200000);
         NSString *pasteStr = toPaste;
         typeString([pasteStr UTF8String]);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            __strong typeof(weakSelf) s = weakSelf;
+        // Restore windows
+        // Restore windows after paste
+        if (wasVisible) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [self.mainWindow makeKeyAndOrderFront:nil];
+                if (advWasVisible) {
+                    NSRect mainFrame = self.mainWindow.frame;
+                    NSRect advFrame = self.advancedWindow.frame;
+                    advFrame.origin.x = NSMaxX(mainFrame) + 8;
+                    advFrame.origin.y = mainFrame.origin.y + (mainFrame.size.height - advFrame.size.height)/2;
+                    [self.advancedWindow setFrame:advFrame display:NO];
+                    [self.advancedWindow orderFront:nil];
+                    [self.mainWindow addChildWindow:self.advancedWindow ordered:NSWindowAbove];
+                }
+            });
+        }
+        // Update UI to show typed
+        __weak typeof(self) weakSelf2 = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf2) s = weakSelf2;
+            if (!s) return;
             s.statusLabel.stringValue = @"Typed into active field ✓";
             s.statusLabel.textColor = [NSColor systemGreenColor];
             if (s.statusButton) s.statusButton.title = @" Typed";
@@ -1731,8 +1909,24 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 
 - (void)hashToggled:(id)sender {
     self.hashEnabled = (self.hashCheck.state == NSControlStateValueOn);
+    self.selectedHash = self.hashEnabled ? CPHashSHA256 : CPHashNone;
+    [[NSUserDefaults standardUserDefaults] setInteger:self.selectedHash forKey:@"CPHash"];
     [[NSUserDefaults standardUserDefaults] setBool:self.hashEnabled forKey:@"CPHashEnabled"];
-    NSLog(@"Hash %@", self.hashEnabled?@"ON (SHA-256)":@"OFF");
+    NSLog(@"Hash (legacy toggle) %@", self.hashEnabled?@"ON (SHA-256)":@"OFF");
+    [self updateTransformedDisplay];
+}
+
+- (void)hashChanged:(id)sender {
+    NSInteger idx = [self.hashPopup indexOfSelectedItem];
+    if (idx == 1) self.selectedHash = CPHashSHA256;
+    else if (idx == 2) self.selectedHash = CPHashSHA512;
+    else if (idx == 3) self.selectedHash = CPHashSHA1;
+    else if (idx == 4) self.selectedHash = CPHashMD5;
+    else self.selectedHash = CPHashNone;
+    self.hashEnabled = (self.selectedHash != CPHashNone);
+    [[NSUserDefaults standardUserDefaults] setInteger:self.selectedHash forKey:@"CPHash"];
+    [[NSUserDefaults standardUserDefaults] setBool:self.hashEnabled forKey:@"CPHashEnabled"];
+    NSLog(@"Hash changed to %ld (%@)", (long)self.selectedHash, [self.hashPopup titleOfSelectedItem]);
     [self updateTransformedDisplay];
 }
 
@@ -1875,7 +2069,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 - (void)copyPreTruncate:(id)sender {
     if (!self.lastRawData) { NSBeep(); return; }
     // Encoded + hashed but before truncate
-    NSString *pre = transformData(self.lastRawData, self.selectedEncoding, self.hashEnabled, 0);
+    NSString *pre = transformData(self.lastRawData, self.selectedEncoding, self.selectedHash, 0);
     copyToClipboard([pre UTF8String]);
     self.statusLabel.stringValue = [NSString stringWithFormat:@"Copied encoded (%lu) ✓", (unsigned long)pre.length];
     self.statusLabel.textColor = [NSColor systemGreenColor];
@@ -1925,18 +2119,27 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     return NO;
 }
 
+- (void)frontmostAppChanged:(NSNotification *)note {
+    NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
+    if (!app) app = [[NSWorkspace sharedWorkspace] frontmostApplication];
+    if (app && ![app.bundleIdentifier isEqualToString:@"com.cardpass.app"] && !app.isHidden && app.activationPolicy == NSApplicationActivationPolicyRegular) {
+        self.lastFrontmostApp = app;
+        NSLog(@"frontmostAppChanged: now %@ (%@)", app.localizedName, app.bundleIdentifier);
+    }
+}
+
 - (NSString *)currentTransformedString {
     // Uses lastRawData + current encoding/hash/truncate to produce the password
     if (!self.lastRawData) {
         // Fallback to hex string if no raw yet (e.g. before first read)
         if (self.lastHex.length > 0) {
             NSData *fallback = dataFromHexString(self.lastHex);
-            if (fallback) return transformData(fallback, self.selectedEncoding, self.hashEnabled, self.truncateLength);
+            if (fallback) return transformData(fallback, self.selectedEncoding, self.selectedHash, self.truncateLength);
             return self.lastHex; // as-is
         }
         return @"";
     }
-    return transformData(self.lastRawData, self.selectedEncoding, self.hashEnabled, self.truncateLength);
+    return transformData(self.lastRawData, self.selectedEncoding, self.selectedHash, self.truncateLength);
 }
 
 - (void)updateTransformedDisplay {
@@ -2012,7 +2215,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     }
     if (self.preTruncateView) {
         if (self.lastRawData) {
-            NSString *pre = transformData(self.lastRawData, self.selectedEncoding, self.hashEnabled, 0);
+            NSString *pre = transformData(self.lastRawData, self.selectedEncoding, self.selectedHash, 0);
             self.preTruncateView.string = pre.length > 0 ? pre : @"(empty)";
             self.preTruncateView.textColor = pre.length > 0 ? [NSColor labelColor] : [NSColor secondaryLabelColor];
         } else {
