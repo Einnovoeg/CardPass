@@ -47,6 +47,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <dlfcn.h>
 
 typedef struct {
     int success;
@@ -84,42 +85,78 @@ static void copyToClipboard(const char *str) {
 }
 
 static BOOL isTrustedForTyping(void) {
-    // On macOS 15 and earlier this checks Accessibility; on Tahoe (27) the same
-    // API maps to Device Control and Data Access. We deliberately use NO prompt
-    // for polling so we don't spam the user, and YES prompt only when user
-    // explicitly asks to enable typing.
+    // On Tahoe (macOS 26/27) posting CGEvents requires Device Control,
+    // not just Accessibility. Check the modern PostEvent API first via runtime
+    // lookup so we compile on older SDKs. Fall back to AXIsProcessTrusted.
+    void *handle = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY);
+    if (handle) {
+        // CGPreflightPostEventAccess is available on 10.15+ but the Device Control
+        // toggle on Tahoe maps to it. If it exists, trust requires it.
+        BOOL (*preflight)(void) = (BOOL (*)(void))dlsym(handle, "CGPreflightPostEventAccess");
+        if (preflight) {
+            BOOL postTrusted = preflight();
+            // Log AX as well for debugging, but don't double-close yet
+            NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @NO};
+            BOOL ax = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+            dlclose(handle);
+            if (postTrusted) {
+                NSLog(@"isTrusted: PostEvent=%d AX=%d (Tahoe path)", postTrusted, ax);
+                return postTrusted;
+            } else {
+                NSLog(@"isTrusted: PostEvent=NO → not trusted (Device Control off) AX=%d", ax);
+                return NO;
+            }
+        }
+        dlclose(handle);
+    }
     NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @NO};
-    return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+    BOOL ax = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+    NSLog(@"isTrusted: AX=%d (fallback path)", ax);
+    return ax;
 }
 
 static void openPrivacySettingsDirectly(void) {
-    // Try to open the correct Privacy pane directly. On Tahoe the toggle moved
-    // from Accessibility to Device Control and Data Access. Try several URLs;
+    // Try to open the correct Privacy pane directly. On Tahoe the toggle is
+    // Device Control and Data Access; on older it's Accessibility. Try several URLs;
     // the system will ignore unknown ones.
     NSArray<NSString*> *candidates = @[
-        @"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
         @"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DeviceControl",
+        @"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
         @"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
         @"x-apple.systempreferences:com.apple.preference.security?Privacy"
     ];
     for (NSString *s in candidates) {
         NSURL *u = [NSURL URLWithString:s];
         if (u && [[NSWorkspace sharedWorkspace] openURL:u]) {
-            // Give System Settings a moment to open; don't try all at once.
-            // Only try first successful one.
             break;
         }
     }
 }
 
 static void requestTypingPermission(void) {
-    // First, let the system show its standard prompt (this is the Apple-sanctioned
-    // flow and will open the *correct* pane for the current OS). Then also try
-    // the direct URLs as fallback for betas where the prompt lands in the wrong place.
+    // Try modern request first (PostEvent) via dynamic lookup, then AX prompt.
+    void *handle = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY);
+    BOOL didRequest = NO;
+    if (handle) {
+        BOOL (*request)(BOOL) = (BOOL (*)(BOOL))dlsym(handle, "CGRequestPostEventAccess");
+        if (request) {
+            didRequest = request(YES); // This shows the Device Control prompt on Tahoe
+            NSLog(@"CGRequestPostEventAccess returned %d", didRequest);
+            dlclose(handle);
+            // Also trigger AX prompt as fallback
+            NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
+            AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+            if (!isTrustedForTyping()) {
+                openPrivacySettingsDirectly();
+            }
+            return;
+        }
+        dlclose(handle);
+    }
+    // Fallback: AX prompt (pre-Tahoe)
     NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
     BOOL wasTrusted = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
     if (!wasTrusted) {
-        // Fallback: try to open Privacy panes directly (helps on Tahoe betas)
         openPrivacySettingsDirectly();
     }
 }
@@ -339,6 +376,15 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 @property (strong, nonatomic) NSTextField *truncateField;
 @property (strong, nonatomic) NSStepper *truncateStepper;
 @property (strong, nonatomic) NSTextField *encodingInfoLabel;
+// Delay
+@property (assign, nonatomic) double autoTypeDelay;
+@property (strong, nonatomic) NSTextField *delayField;
+@property (strong, nonatomic) NSStepper *delayStepper;
+// Advanced pane (slide-out to the right)
+@property (strong, nonatomic) NSView *advancedPane;
+@property (strong, nonatomic) NSTextView *rawHexView;
+@property (strong, nonatomic) NSTextView *preTruncateView;
+@property (assign, nonatomic) BOOL advancedVisible;
 
 - (void)setupMainMenu;
 - (void)setupStatusItem;
@@ -357,6 +403,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 - (void)refreshReaders:(id)sender;
 - (void)checkAccessibility:(id)sender;
 - (void)openBuyMeACoffee:(id)sender;
+- (void)showRawHexPanel:(id)sender;
 - (void)encodingChanged:(id)sender;
 - (void)hashToggled:(id)sender;
 - (void)truncateChanged:(id)sender;
@@ -376,6 +423,8 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     _selectedEncoding = CPEncodingHex;
     _hashEnabled = NO;
     _truncateLength = 0; // 0 = no truncation
+    _autoTypeDelay = 1.0;
+    _advancedVisible = NO;
     // Restore user prefs if any
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSInteger savedEnc = [defaults integerForKey:@"CPEncoding"];
@@ -384,6 +433,9 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     _truncateLength = [defaults integerForKey:@"CPTruncateLength"];
     if (_truncateLength < 0) _truncateLength = 0;
     if (_truncateLength > 128) _truncateLength = 128;
+    double savedDelay = [defaults doubleForKey:@"CPAutoTypeDelay"];
+    if (savedDelay >= 0.2 && savedDelay <= 10.0) _autoTypeDelay = savedDelay;
+    _advancedVisible = [defaults boolForKey:@"CPAdvancedVisible"];
 
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp activateIgnoringOtherApps:YES];
@@ -394,6 +446,18 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     [self setupWindow];
     [self setupStatusItem];
 
+    // If advanced was visible last run, expand window immediately
+    if (_advancedVisible) {
+        NSRect f = self.mainWindow.frame;
+        f.size.width += 300;
+        f.origin.x -= 150;
+        [self.mainWindow setFrame:f display:NO];
+        self.advancedPane.hidden = NO;
+        // Update button title
+        NSButton *btn = (NSButton *)[self.mainWindow.contentView viewWithTag:999];
+        if (btn) btn.title = @"◀ Advanced";
+    }
+
     _pollTimer = [NSTimer scheduledTimerWithTimeInterval:1.5 target:self selector:@selector(pollReaders) userInfo:nil repeats:YES];
     [_pollTimer fire];
 
@@ -402,7 +466,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
         [NSApp activateIgnoringOtherApps:YES];
     });
 
-    NSLog(@"CardPass launched: window + status item ready");
+    NSLog(@"CardPass launched: window + status item ready (delay %.1fs, enc %ld)", _autoTypeDelay, (long)_selectedEncoding);
 }
 
 - (void)setupMainMenu {
@@ -460,6 +524,19 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     windowMenuItem.submenu = windowMenu;
     [mainMenu addItem:windowMenuItem];
 
+    // View menu — Advanced pane lives here, NOT in main App menu (per spec: raw data not in main menu)
+    NSMenuItem *viewMenuItem = [[NSMenuItem alloc] initWithTitle:@"View" action:nil keyEquivalent:@""];
+    NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
+    NSMenuItem *advViewItem = [[NSMenuItem alloc] initWithTitle:@"Show Advanced Pane" action:@selector(toggleAdvancedPane:) keyEquivalent:@"a"];
+    advViewItem.target = self;
+    advViewItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    [viewMenu addItem:advViewItem];
+    NSMenuItem *rawViewItem = [[NSMenuItem alloc] initWithTitle:@"Show Raw Hex…" action:@selector(showRawHexPanel:) keyEquivalent:@""];
+    rawViewItem.target = self;
+    [viewMenu addItem:rawViewItem];
+    viewMenuItem.submenu = viewMenu;
+    [mainMenu addItem:viewMenuItem];
+
     [NSApp setMainMenu:mainMenu];
 
     NSApplication *app = NSApp;
@@ -473,26 +550,28 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 }
 
 - (void)setupWindow {
-    // Window is 520×500 to fit encoding controls (hex/Base62 + hash/truncate row)
-    NSRect frame = NSMakeRect(0, 0, 520, 500);
+    NSRect frame = NSMakeRect(0, 0, 520, 470);
     NSWindow *w = [[NSWindow alloc] initWithContentRect:frame
                                               styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                                 backing:NSBackingStoreBuffered defer:NO];
     w.title = @"CardPass";
     w.delegate = self;
     w.releasedWhenClosed = NO;
-    w.minSize = NSMakeSize(520, 480);
+    w.minSize = NSMakeSize(520, 450);
     [w center];
-    w.backgroundColor = [NSColor windowBackgroundColor];
     w.titlebarAppearsTransparent = NO;
-    w.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+    w.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    w.backgroundColor = [NSColor colorWithWhite:0.13 alpha:1.0];
     self.mainWindow = w;
 
     NSView *content = w.contentView;
+    content.wantsLayer = YES;
+    content.layer.backgroundColor = [[NSColor colorWithWhite:0.13 alpha:1.0] CGColor];
 
-    NSView *header = [[NSView alloc] initWithFrame:NSMakeRect(0, 440, 520, 60)];
+    NSView *header = [[NSView alloc] initWithFrame:NSMakeRect(0, 422, 520, 48)];
     header.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     header.wantsLayer = YES;
+    header.layer.backgroundColor = [[NSColor colorWithWhite:0.16 alpha:1.0] CGColor];
 
     NSImageView *iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(16, 14, 36, 36)];
     NSString *icnsPath = [[NSBundle mainBundle] pathForResource:@"AppIcon" ofType:@"icns"];
@@ -524,7 +603,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     [header addSubview:sep];
     [content addSubview:header];
 
-    NSTextField *statusTitle = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 410, 60, 16)];
+    NSTextField *statusTitle = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 390, 60, 16)];
     statusTitle.stringValue = @"Status:";
     statusTitle.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
     statusTitle.textColor = [NSColor secondaryLabelColor];
@@ -532,7 +611,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     statusTitle.autoresizingMask = NSViewMaxYMargin | NSViewMinXMargin;
     [content addSubview:statusTitle];
 
-    self.statusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(70, 408, 360, 20)];
+    self.statusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(70, 388, 360, 20)];
     self.statusLabel.stringValue = @"Initializing...";
     self.statusLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
     self.statusLabel.textColor = [NSColor labelColor];
@@ -540,7 +619,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.statusLabel.autoresizingMask = NSViewMaxYMargin | NSViewWidthSizable;
     [content addSubview:self.statusLabel];
 
-    self.spinner = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(460, 408, 16, 16)];
+    self.spinner = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(460, 388, 16, 16)];
     self.spinner.style = NSProgressIndicatorStyleSpinning;
     self.spinner.controlSize = NSControlSizeSmall;
     self.spinner.displayedWhenStopped = NO;
@@ -548,7 +627,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.spinner.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [content addSubview:self.spinner];
 
-    NSTextField *readersLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 388, 100, 14)];
+    NSTextField *readersLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 368, 100, 14)];
     readersLabel.stringValue = @"Readers";
     readersLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
     readersLabel.textColor = [NSColor labelColor];
@@ -556,7 +635,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     readersLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:readersLabel];
 
-    self.readerCountLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(70, 388, 120, 14)];
+    self.readerCountLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(70, 368, 120, 14)];
     self.readerCountLabel.stringValue = @"(scanning...)";
     self.readerCountLabel.font = [NSFont systemFontOfSize:10];
     self.readerCountLabel.textColor = [NSColor secondaryLabelColor];
@@ -564,7 +643,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.readerCountLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.readerCountLabel];
 
-    NSScrollView *readersScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 306, 488, 78)];
+    NSScrollView *readersScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 286, 488, 70)];
     readersScroll.hasVerticalScroller = YES;
     readersScroll.hasHorizontalScroller = NO;
     readersScroll.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
@@ -586,7 +665,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     // --- Encoding controls bar (new) ---
     // Encoding popup: Hex / Base62 (recommended) / Base58 / Base64
     // Plus hash checkbox and truncate length
-    NSTextField *encLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 282, 50, 14)];
+    NSTextField *encLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 265, 50, 14)];
     encLabel.stringValue = @"Output:";
     encLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
     encLabel.textColor = [NSColor labelColor];
@@ -594,7 +673,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     encLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:encLabel];
 
-    self.encodingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(70, 277, 140, 24) pullsDown:NO];
+    self.encodingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(70, 260, 140, 24) pullsDown:NO];
     [self.encodingPopup addItemsWithTitles:@[@"Hex (Base16)", @"Base62 (A-Za-z0-9)", @"Base58 (no 0/O/I/l)", @"Base64 (+/ with =)"]];
     [self.encodingPopup selectItemAtIndex:self.selectedEncoding];
     self.encodingPopup.target = self;
@@ -603,7 +682,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.encodingPopup.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.encodingPopup];
 
-    self.hashCheck = [[NSButton alloc] initWithFrame:NSMakeRect(220, 282, 110, 18)];
+    self.hashCheck = [[NSButton alloc] initWithFrame:NSMakeRect(220, 265, 110, 18)];
     [self.hashCheck setButtonType:NSButtonTypeSwitch];
     self.hashCheck.title = @"Hash SHA-256";
     self.hashCheck.state = self.hashEnabled ? NSControlStateValueOn : NSControlStateValueOff;
@@ -614,7 +693,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.hashCheck.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.hashCheck];
 
-    NSTextField *truncLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(340, 282, 42, 14)];
+    NSTextField *truncLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(340, 265, 42, 14)];
     truncLabel.stringValue = @"Truncate:";
     truncLabel.font = [NSFont systemFontOfSize:11];
     truncLabel.textColor = [NSColor secondaryLabelColor];
@@ -622,7 +701,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     truncLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:truncLabel];
 
-    self.truncateField = [[NSTextField alloc] initWithFrame:NSMakeRect(385, 278, 44, 22)];
+    self.truncateField = [[NSTextField alloc] initWithFrame:NSMakeRect(385, 261, 44, 22)];
     self.truncateField.stringValue = self.truncateLength > 0 ? [NSString stringWithFormat:@"%ld", (long)self.truncateLength] : @"";
     self.truncateField.placeholderString = @"e.g. 24";
     self.truncateField.font = [NSFont systemFontOfSize:11];
@@ -635,7 +714,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     [self.truncateField setDelegate:(id<NSTextFieldDelegate>)self];
     [content addSubview:self.truncateField];
 
-    self.truncateStepper = [[NSStepper alloc] initWithFrame:NSMakeRect(430, 278, 19, 22)];
+    self.truncateStepper = [[NSStepper alloc] initWithFrame:NSMakeRect(430, 261, 19, 22)];
     self.truncateStepper.minValue = 0; self.truncateStepper.maxValue = 128; self.truncateStepper.increment = 1;
     self.truncateStepper.valueWraps = NO;
     self.truncateStepper.doubleValue = self.truncateLength;
@@ -644,7 +723,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.truncateStepper.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.truncateStepper];
 
-    self.encodingInfoLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(455, 282, 50, 14)];
+    self.encodingInfoLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(455, 265, 50, 14)];
     self.encodingInfoLabel.stringValue = @"";
     self.encodingInfoLabel.font = [NSFont systemFontOfSize:10];
     self.encodingInfoLabel.textColor = [NSColor secondaryLabelColor];
@@ -652,7 +731,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.encodingInfoLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.encodingInfoLabel];
 
-    NSTextField *hexLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 260, 200, 14)];
+    NSTextField *hexLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 242, 200, 14)];
     hexLabel.stringValue = @"Card Data (password)";
     hexLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
     hexLabel.textColor = [NSColor labelColor];
@@ -660,7 +739,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     hexLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:hexLabel];
 
-    NSTextField *hexHint = [[NSTextField alloc] initWithFrame:NSMakeRect(140, 260, 360, 12)];
+    NSTextField *hexHint = [[NSTextField alloc] initWithFrame:NSMakeRect(140, 242, 360, 12)];
     hexHint.stringValue = @"— copied to clipboard, auto-type is optional (needs Device Control)";
     hexHint.font = [NSFont systemFontOfSize:10];
     hexHint.textColor = [NSColor secondaryLabelColor];
@@ -668,7 +747,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     hexHint.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:hexHint];
 
-    NSScrollView *hexScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 138, 488, 118)];
+    NSScrollView *hexScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 118, 488, 112)];
     hexScroll.hasVerticalScroller = YES;
     hexScroll.hasHorizontalScroller = NO;
     hexScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -689,7 +768,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     hexScroll.documentView = self.hexTextView;
     [content addSubview:hexScroll];
 
-    self.clipboardBtn = [[NSButton alloc] initWithFrame:NSMakeRect(16, 100, 150, 28)];
+    self.clipboardBtn = [[NSButton alloc] initWithFrame:NSMakeRect(16, 80, 140, 26)];
     self.clipboardBtn.title = @"Copy to Clipboard";
     self.clipboardBtn.bezelStyle = NSBezelStyleRounded;
     self.clipboardBtn.target = self;
@@ -700,7 +779,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     [self.clipboardBtn setEnabled:NO];
     [content addSubview:self.clipboardBtn];
 
-    self.typeButton = [[NSButton alloc] initWithFrame:NSMakeRect(174, 100, 158, 28)];
+    self.typeButton = [[NSButton alloc] initWithFrame:NSMakeRect(164, 80, 140, 26)];
     self.typeButton.title = @"Type into Field";
     self.typeButton.bezelStyle = NSBezelStyleRounded;
     self.typeButton.target = self;
@@ -709,7 +788,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     [self.typeButton setEnabled:NO];
     [content addSubview:self.typeButton];
 
-    self.clearButton = [[NSButton alloc] initWithFrame:NSMakeRect(340, 100, 80, 28)];
+    self.clearButton = [[NSButton alloc] initWithFrame:NSMakeRect(312, 80, 70, 26)];
     self.clearButton.title = @"Clear";
     self.clearButton.bezelStyle = NSBezelStyleRounded;
     self.clearButton.target = self;
@@ -717,7 +796,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.clearButton.autoresizingMask = NSViewMaxYMargin | NSViewMinYMargin;
     [content addSubview:self.clearButton];
 
-    NSButton *refreshBtn = [[NSButton alloc] initWithFrame:NSMakeRect(428, 100, 76, 28)];
+    NSButton *refreshBtn = [[NSButton alloc] initWithFrame:NSMakeRect(390, 80, 70, 26)];
     refreshBtn.title = @"Refresh";
     refreshBtn.bezelStyle = NSBezelStyleRounded;
     refreshBtn.target = self;
@@ -725,17 +804,18 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     refreshBtn.autoresizingMask = NSViewMaxYMargin | NSViewMinYMargin | NSViewMinXMargin;
     [content addSubview:refreshBtn];
 
-    self.autoCopyCheck = [[NSButton alloc] initWithFrame:NSMakeRect(16, 70, 150, 18)];
+    // More compact bottom bar: auto-copy/type + delay + advanced
+    self.autoCopyCheck = [[NSButton alloc] initWithFrame:NSMakeRect(16, 50, 110, 18)];
     [self.autoCopyCheck setButtonType:NSButtonTypeSwitch];
-    self.autoCopyCheck.title = @"Auto-copy on scan";
+    self.autoCopyCheck.title = @"Auto-copy";
     self.autoCopyCheck.state = NSControlStateValueOn;
     self.autoCopyCheck.font = [NSFont systemFontOfSize:11];
     self.autoCopyCheck.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.autoCopyCheck];
 
-    self.autoTypeCheck = [[NSButton alloc] initWithFrame:NSMakeRect(180, 70, 170, 18)];
+    self.autoTypeCheck = [[NSButton alloc] initWithFrame:NSMakeRect(135, 50, 105, 18)];
     [self.autoTypeCheck setButtonType:NSButtonTypeSwitch];
-    self.autoTypeCheck.title = @"Auto-type into active field";
+    self.autoTypeCheck.title = @"Auto-type";
     self.autoTypeCheck.state = NSControlStateValueOn;
     self.autoTypeCheck.font = [NSFont systemFontOfSize:11];
     self.autoTypeCheck.target = self;
@@ -743,14 +823,52 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.autoTypeCheck.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.autoTypeCheck];
 
-    NSTextField *delayHint = [[NSTextField alloc] initWithFrame:NSMakeRect(360, 70, 144, 14)];
-    delayHint.stringValue = @"1s delay before typing";
-    delayHint.font = [NSFont systemFontOfSize:10];
-    delayHint.textColor = [NSColor secondaryLabelColor];
-    delayHint.bezeled = NO; delayHint.drawsBackground = NO; delayHint.editable = NO; delayHint.selectable = NO;
-    delayHint.alignment = NSTextAlignmentRight;
-    delayHint.autoresizingMask = NSViewMaxYMargin | NSViewMinXMargin;
-    [content addSubview:delayHint];
+    NSTextField *delayLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(250, 50, 38, 14)];
+    delayLabel.stringValue = @"Delay:";
+    delayLabel.font = [NSFont systemFontOfSize:11];
+    delayLabel.textColor = [NSColor secondaryLabelColor];
+    delayLabel.bezeled = NO; delayLabel.drawsBackground = NO; delayLabel.editable = NO; delayLabel.selectable = NO;
+    delayLabel.autoresizingMask = NSViewMaxYMargin;
+    [content addSubview:delayLabel];
+
+    self.delayField = [[NSTextField alloc] initWithFrame:NSMakeRect(290, 48, 36, 20)];
+    self.delayField.stringValue = [NSString stringWithFormat:@"%.1f", self.autoTypeDelay];
+    self.delayField.font = [NSFont systemFontOfSize:11];
+    self.delayField.alignment = NSTextAlignmentCenter;
+    self.delayField.target = self;
+    self.delayField.action = @selector(delayChanged:);
+    self.delayField.toolTip = @"Seconds to wait before auto-typing (0.2-10s). Clipboard is instant.";
+    self.delayField.autoresizingMask = NSViewMaxYMargin;
+    [self.delayField setDelegate:(id<NSTextFieldDelegate>)self];
+    [content addSubview:self.delayField];
+
+    self.delayStepper = [[NSStepper alloc] initWithFrame:NSMakeRect(327, 48, 19, 20)];
+    self.delayStepper.minValue = 0.2; self.delayStepper.maxValue = 10.0; self.delayStepper.increment = 0.5;
+    self.delayStepper.valueWraps = NO;
+    self.delayStepper.doubleValue = self.autoTypeDelay;
+    self.delayStepper.target = self;
+    self.delayStepper.action = @selector(delayChanged:);
+    self.delayStepper.autoresizingMask = NSViewMaxYMargin;
+    [content addSubview:self.delayStepper];
+
+    NSTextField *delayUnit = [[NSTextField alloc] initWithFrame:NSMakeRect(348, 50, 12, 14)];
+    delayUnit.stringValue = @"s";
+    delayUnit.font = [NSFont systemFontOfSize:11];
+    delayUnit.textColor = [NSColor secondaryLabelColor];
+    delayUnit.bezeled = NO; delayUnit.drawsBackground = NO; delayUnit.editable = NO; delayUnit.selectable = NO;
+    delayUnit.autoresizingMask = NSViewMaxYMargin;
+    [content addSubview:delayUnit];
+
+    NSButton *advancedBtn = [[NSButton alloc] initWithFrame:NSMakeRect(375, 48, 95, 22)];
+    advancedBtn.title = self.advancedVisible ? @"◀ Advanced" : @"Advanced ▶";
+    advancedBtn.tag = 999;
+    advancedBtn.bezelStyle = NSBezelStyleRounded;
+    advancedBtn.font = [NSFont systemFontOfSize:11];
+    advancedBtn.target = self;
+    advancedBtn.action = @selector(toggleAdvancedPane:);
+    advancedBtn.toolTip = @"Show raw hex, pre-truncate data, and ATR — the non-encoded source";
+    advancedBtn.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    [content addSubview:advancedBtn];
 
     // Subtle support link — does not distract from primary actions
     NSButton *coffeeLink = [[NSButton alloc] initWithFrame:NSMakeRect(380, 6, 124, 18)];
@@ -761,14 +879,107 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     coffeeLink.action = @selector(openBuyMeACoffee:);
     coffeeLink.toolTip = @"Support CardPass at buymeacoffee.com/einnovoeg";
     coffeeLink.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    // Use link appearance where available
     if ([coffeeLink respondsToSelector:@selector(setButtonType:)]) {
-        // keep as regular button but tinted
         coffeeLink.contentTintColor = [NSColor systemPinkColor];
     }
     [content addSubview:coffeeLink];
 
-    NSBox *bottomSep = [[NSBox alloc] initWithFrame:NSMakeRect(0, 90, 520, 1)];
+    // Advanced pane (hidden by default, slides out to the right)
+    self.advancedPane = [[NSView alloc] initWithFrame:NSMakeRect(520, 0, 300, 470)];
+    self.advancedPane.wantsLayer = YES;
+    self.advancedPane.layer.backgroundColor = [[NSColor colorWithWhite:0.11 alpha:1.0] CGColor];
+    self.advancedPane.autoresizingMask = NSViewMinXMargin | NSViewHeightSizable;
+    self.advancedPane.hidden = !self.advancedVisible;
+
+    NSBox *advSep = [[NSBox alloc] initWithFrame:NSMakeRect(0, 0, 1, 470)];
+    advSep.boxType = NSBoxSeparator;
+    advSep.autoresizingMask = NSViewHeightSizable | NSViewMinXMargin;
+    [self.advancedPane addSubview:advSep];
+
+    NSTextField *advTitle = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 440, 276, 16)];
+    advTitle.stringValue = @"Advanced — Raw & Pre-Truncate";
+    advTitle.font = [NSFont boldSystemFontOfSize:12];
+    advTitle.textColor = [NSColor labelColor];
+    advTitle.bezeled = NO; advTitle.drawsBackground = NO; advTitle.editable = NO; advTitle.selectable = NO;
+    [self.advancedPane addSubview:advTitle];
+
+    NSTextField *rawLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 418, 276, 12)];
+    rawLabel.stringValue = @"Raw Hex (non-encoded, non-hashed, non-truncated):";
+    rawLabel.font = [NSFont systemFontOfSize:10 weight:NSFontWeightSemibold];
+    rawLabel.textColor = [NSColor secondaryLabelColor];
+    rawLabel.bezeled = NO; rawLabel.drawsBackground = NO; rawLabel.editable = NO; rawLabel.selectable = NO;
+    [self.advancedPane addSubview:rawLabel];
+
+    NSScrollView *rawScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 300, 276, 100)];
+    rawScroll.hasVerticalScroller = YES;
+    rawScroll.borderType = NSBezelBorder;
+    rawScroll.drawsBackground = YES;
+    rawScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    NSSize rawSize = rawScroll.contentSize;
+    self.rawHexView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, rawSize.width, rawSize.height)];
+    self.rawHexView.editable = NO; self.rawHexView.selectable = YES;
+    self.rawHexView.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular];
+    self.rawHexView.textColor = [NSColor labelColor];
+    self.rawHexView.backgroundColor = [NSColor textBackgroundColor];
+    self.rawHexView.string = @"(raw data appears here after card read)";
+    self.rawHexView.textContainerInset = NSMakeSize(4,4);
+    [self.rawHexView setAutomaticQuoteSubstitutionEnabled:NO];
+    rawScroll.documentView = self.rawHexView;
+    [self.advancedPane addSubview:rawScroll];
+
+    NSTextField *preLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 280, 276, 12)];
+    preLabel.stringValue = @"Encoded + Hashed (pre-truncate):";
+    preLabel.font = [NSFont systemFontOfSize:10 weight:NSFontWeightSemibold];
+    preLabel.textColor = [NSColor secondaryLabelColor];
+    preLabel.bezeled = NO; preLabel.drawsBackground = NO; preLabel.editable = NO; preLabel.selectable = NO;
+    [self.advancedPane addSubview:preLabel];
+
+    NSScrollView *preScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 110, 276, 150)];
+    preScroll.hasVerticalScroller = YES;
+    preScroll.borderType = NSBezelBorder;
+    preScroll.drawsBackground = YES;
+    preScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    NSSize preSize = preScroll.contentSize;
+    self.preTruncateView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, preSize.width, preSize.height)];
+    self.preTruncateView.editable = NO; self.preTruncateView.selectable = YES;
+    self.preTruncateView.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular];
+    self.preTruncateView.textColor = [NSColor labelColor];
+    self.preTruncateView.backgroundColor = [NSColor textBackgroundColor];
+    self.preTruncateView.string = @"(encoded data before truncation)";
+    self.preTruncateView.textContainerInset = NSMakeSize(4,4);
+    [self.preTruncateView setAutomaticQuoteSubstitutionEnabled:NO];
+    preScroll.documentView = self.preTruncateView;
+    [self.advancedPane addSubview:preScroll];
+
+    NSButton *copyRawBtn = [[NSButton alloc] initWithFrame:NSMakeRect(12, 108, 120, 22)];
+    copyRawBtn.title = @"Copy Raw Hex";
+    copyRawBtn.bezelStyle = NSBezelStyleRounded;
+    copyRawBtn.font = [NSFont systemFontOfSize:11];
+    copyRawBtn.target = self;
+    copyRawBtn.action = @selector(copyRawHex:);
+    [self.advancedPane addSubview:copyRawBtn];
+
+    NSButton *copyPreBtn = [[NSButton alloc] initWithFrame:NSMakeRect(140, 108, 148, 22)];
+    copyPreBtn.title = @"Copy Encoded";
+    copyPreBtn.bezelStyle = NSBezelStyleRounded;
+    copyPreBtn.font = [NSFont systemFontOfSize:11];
+    copyPreBtn.target = self;
+    copyPreBtn.action = @selector(copyPreTruncate:);
+    [self.advancedPane addSubview:copyPreBtn];
+
+    NSTextField *advHint = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 12, 276, 90)];
+    advHint.stringValue = @"Raw Hex is the exact bytes from the card (hex). Encoded shows the result after Base62/58/64 + SHA-256 but before truncation — useful to verify what was shortened. Main password field (left) is the final truncated output.";
+    advHint.font = [NSFont systemFontOfSize:10];
+    advHint.textColor = [NSColor secondaryLabelColor];
+    advHint.bezeled = NO; advHint.drawsBackground = NO; advHint.editable = NO; advHint.selectable = NO;
+    advHint.usesSingleLineMode = NO;
+    [advHint setPreferredMaxLayoutWidth:276];
+    advHint.autoresizingMask = NSViewWidthSizable;
+    [self.advancedPane addSubview:advHint];
+
+    [content addSubview:self.advancedPane];
+
+    NSBox *bottomSep = [[NSBox alloc] initWithFrame:NSMakeRect(0, 70, 520, 1)];
     bottomSep.boxType = NSBoxSeparator;
     bottomSep.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     [content addSubview:bottomSep];
@@ -837,6 +1048,25 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     NSMenuItem *showReadersItem = [[NSMenuItem alloc] initWithTitle:@"Show Readers Detail..." action:@selector(showReaders:) keyEquivalent:@""];
     showReadersItem.target = self;
     [self.statusMenu addItem:showReadersItem];
+
+    // Advanced submenu — raw data lives here, NOT in main menu (per spec)
+    NSMenuItem *advancedMenuItem = [[NSMenuItem alloc] initWithTitle:@"Advanced" action:nil keyEquivalent:@""];
+    NSMenu *advancedMenu = [[NSMenu alloc] initWithTitle:@"Advanced"];
+    NSMenuItem *showAdvItem = [[NSMenuItem alloc] initWithTitle:@"Show Advanced Pane" action:@selector(toggleAdvancedPane:) keyEquivalent:@""];
+    showAdvItem.target = self;
+    showAdvItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    [advancedMenu addItem:showAdvItem];
+    NSMenuItem *showRawItem = [[NSMenuItem alloc] initWithTitle:@"Show Raw Hex…" action:@selector(showRawHexPanel:) keyEquivalent:@""];
+    showRawItem.target = self;
+    [advancedMenu addItem:showRawItem];
+    NSMenuItem *copyPreItem = [[NSMenuItem alloc] initWithTitle:@"Copy Encoded (pre-truncate)" action:@selector(copyPreTruncate:) keyEquivalent:@""];
+    copyPreItem.target = self;
+    [advancedMenu addItem:copyPreItem];
+    NSMenuItem *copyRawItem = [[NSMenuItem alloc] initWithTitle:@"Copy Raw Hex" action:@selector(copyRawHex:) keyEquivalent:@""];
+    copyRawItem.target = self;
+    [advancedMenu addItem:copyRawItem];
+    advancedMenuItem.submenu = advancedMenu;
+    [self.statusMenu addItem:advancedMenuItem];
 
     [self.statusMenu addItem:[NSMenuItem separatorItem]];
 
@@ -1095,11 +1325,14 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
                 // Note: user can still enable auto-type via menu → Check Device Control Permission.
                 // We don't auto-popup the permission dialog on every scan — that was the bug.
             } else {
-                self.statusLabel.stringValue = [NSString stringWithFormat:@"Typing in 1s… (%@)", name];
+                NSString *delayStr = [NSString stringWithFormat:@"%.1f", self.autoTypeDelay];
+                // Trim trailing .0 for nicer display
+                if ([delayStr hasSuffix:@".0"]) delayStr = [delayStr substringToIndex:delayStr.length-2];
+                self.statusLabel.stringValue = [NSString stringWithFormat:@"Typing in %@s… (%@)", delayStr, name];
                 self.statusLabel.textColor = [NSColor systemBlueColor];
                 if (self.statusButton) self.statusButton.title = @" Typing...";
 
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(self.autoTypeDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     if (!self.lastHex || self.lastHex.length==0) return;
                     // Double-check trust just before typing (user may have revoked)
                     if (!isTrustedForTyping()) {
@@ -1232,6 +1465,8 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.clipboardBtn.enabled = NO;
     self.typeButton.enabled = NO;
     self.encodingInfoLabel.stringValue = @"";
+    self.rawHexView.string = @"(raw data appears here after card read)";
+    self.preTruncateView.string = @"(encoded data before truncation)";
 }
 
 - (void)toggleAutoType:(id)sender {
@@ -1280,14 +1515,120 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     [self updateTransformedDisplay];
 }
 
+- (void)delayChanged:(id)sender {
+    double val = self.autoTypeDelay;
+    if (sender == self.delayStepper) {
+        val = self.delayStepper.doubleValue;
+        self.delayField.stringValue = [NSString stringWithFormat:@"%.1f", val];
+    } else {
+        NSString *s = [self.delayField.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        val = [s doubleValue];
+        if (val < 0.2) val = 0.2;
+        if (val > 10.0) val = 10.0;
+        self.delayStepper.doubleValue = val;
+        self.delayField.stringValue = [NSString stringWithFormat:@"%.1f", val];
+    }
+    self.autoTypeDelay = val;
+    [[NSUserDefaults standardUserDefaults] setDouble:self.autoTypeDelay forKey:@"CPAutoTypeDelay"];
+    NSLog(@"Delay set to %.1f s", self.autoTypeDelay);
+}
+
+- (void)toggleAdvancedPane:(id)sender {
+    self.advancedVisible = !self.advancedVisible;
+    [[NSUserDefaults standardUserDefaults] setBool:self.advancedVisible forKey:@"CPAdvancedVisible"];
+    // Find the Advanced button by tag 999 (set in setupWindow)
+    NSView *content = self.mainWindow.contentView;
+    NSButton *advBtn = (NSButton *)[content viewWithTag:999];
+    if (!advBtn) {
+        // search deeper
+        for (NSView *sv in content.subviews) {
+            advBtn = (NSButton *)[sv viewWithTag:999];
+            if (advBtn) break;
+        }
+    }
+    if (advBtn) advBtn.title = self.advancedVisible ? @"◀ Advanced" : @"Advanced ▶";
+    // Animate window resize
+    NSRect frame = self.mainWindow.frame;
+    CGFloat delta = 300;
+    if (self.advancedVisible) {
+        frame.size.width += delta;
+        frame.origin.x -= delta/2; // keep centered
+        self.advancedPane.hidden = NO;
+    } else {
+        frame.size.width -= delta;
+        frame.origin.x += delta/2;
+    }
+    [self.mainWindow setFrame:frame display:YES animate:YES];
+    if (!self.advancedVisible) {
+        // Hide after animation
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            self.advancedPane.hidden = YES;
+        });
+    } else {
+        // Update raw views
+        [self updateTransformedDisplay];
+    }
+    NSLog(@"Advanced pane %@", self.advancedVisible?@"shown":@"hidden");
+}
+
+- (void)copyRawHex:(id)sender {
+    if (!self.lastRawData) { NSBeep(); return; }
+    // Show raw hex (non-encoded)
+    NSMutableString *hex = [NSMutableString stringWithCapacity:self.lastRawData.length*2];
+    const uint8_t *b = self.lastRawData.bytes;
+    for (NSUInteger i=0;i<self.lastRawData.length;i++) [hex appendFormat:@"%02X", b[i]];
+    copyToClipboard([hex UTF8String]);
+    self.statusLabel.stringValue = @"Copied raw hex ✓";
+    self.statusLabel.textColor = [NSColor systemGreenColor];
+}
+
+- (void)copyPreTruncate:(id)sender {
+    if (!self.lastRawData) { NSBeep(); return; }
+    // Encoded + hashed but before truncate
+    NSString *pre = transformData(self.lastRawData, self.selectedEncoding, self.hashEnabled, 0);
+    copyToClipboard([pre UTF8String]);
+    self.statusLabel.stringValue = [NSString stringWithFormat:@"Copied encoded (%lu) ✓", (unsigned long)pre.length];
+    self.statusLabel.textColor = [NSColor systemGreenColor];
+}
+
+- (void)showRawHexPanel:(id)sender {
+    // Ensure advanced pane is visible so user sees both raw and encoded
+    if (!self.advancedVisible) [self toggleAdvancedPane:sender];
+    [self showWindowAction:sender];
+    // Also show a sheet with raw hex for quick copy
+    if (!self.lastRawData) {
+        NSAlert *a = [[NSAlert alloc] init];
+        a.messageText = @"No Raw Data Yet";
+        a.informativeText = @"Insert a card to see raw hex. The Advanced pane (right side) will show: Raw Hex (exact bytes from card) and Encoded pre-truncate. The main password field (left) is the final truncated output and is unchanged.";
+        [a addButtonWithTitle:@"OK"];
+        [a beginSheetModalForWindow:self.mainWindow completionHandler:nil];
+        return;
+    }
+    NSMutableString *rawHex = [NSMutableString stringWithCapacity:self.lastRawData.length*2];
+    const uint8_t *b = self.lastRawData.bytes;
+    for (NSUInteger i=0;i<self.lastRawData.length;i++) [rawHex appendFormat:@"%02X", b[i]];
+    NSAlert *a = [[NSAlert alloc] init];
+    a.messageText = @"Raw Hex (from card)";
+    a.informativeText = [NSString stringWithFormat:@"Exact bytes as read (non-encoded, non-hashed, non-truncated):\n\n%@\n\nLength: %lu bytes / %lu hex chars\n\nThis is also visible in the Advanced pane → Raw Hex. The main field shows the final password after encoding/hash/truncate.", rawHex, (unsigned long)self.lastRawData.length, (unsigned long)rawHex.length];
+    [a addButtonWithTitle:@"Copy Raw Hex"];
+    [a addButtonWithTitle:@"OK"];
+    NSModalResponse r = [a runModal];
+    if (r == NSAlertFirstButtonReturn) {
+        copyToClipboard([rawHex UTF8String]);
+        self.statusLabel.stringValue = @"Copied raw hex ✓";
+    }
+}
+
 - (void)controlTextDidEndEditing:(NSNotification *)obj {
     if (obj.object == self.truncateField) [self truncateChanged:self.truncateField];
+    else if (obj.object == self.delayField) [self delayChanged:self.delayField];
 }
 
 - (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)commandSelector {
-    // Allow Enter to commit truncate field
-    if (control == self.truncateField && commandSelector == @selector(insertNewline:)) {
-        [self truncateChanged:self.truncateField];
+    // Allow Enter to commit fields
+    if ((control == self.truncateField || control == self.delayField) && commandSelector == @selector(insertNewline:)) {
+        if (control == self.truncateField) [self truncateChanged:self.truncateField];
+        else [self delayChanged:self.delayField];
         [[control window] makeFirstResponder:nil];
         return YES;
     }
@@ -1343,6 +1684,30 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
         info = [NSString stringWithFormat:@"%lu %@%@%@", (unsigned long)transformed.length, encName, hashNote, truncNote];
     }
     self.encodingInfoLabel.stringValue = info;
+
+    // Update advanced pane raw / pre-truncate views
+    if (self.rawHexView) {
+        if (self.lastRawData) {
+            NSMutableString *rawHex = [NSMutableString stringWithCapacity:self.lastRawData.length*2];
+            const uint8_t *b = self.lastRawData.bytes;
+            for (NSUInteger i=0;i<self.lastRawData.length;i++) [rawHex appendFormat:@"%02X", b[i]];
+            self.rawHexView.string = rawHex;
+            self.rawHexView.textColor = [NSColor labelColor];
+        } else {
+            self.rawHexView.string = @"(raw data appears here after card read)";
+            self.rawHexView.textColor = [NSColor secondaryLabelColor];
+        }
+    }
+    if (self.preTruncateView) {
+        if (self.lastRawData) {
+            NSString *pre = transformData(self.lastRawData, self.selectedEncoding, self.hashEnabled, 0);
+            self.preTruncateView.string = pre.length > 0 ? pre : @"(empty)";
+            self.preTruncateView.textColor = pre.length > 0 ? [NSColor labelColor] : [NSColor secondaryLabelColor];
+        } else {
+            self.preTruncateView.string = @"(encoded data before truncation)";
+            self.preTruncateView.textColor = [NSColor secondaryLabelColor];
+        }
+    }
 
     // Enable copy/type if we have something to copy
     BOOL has = transformed.length > 0;

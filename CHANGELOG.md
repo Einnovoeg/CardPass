@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here. Follows Keep-a-Changelog and SemVer.
 
+## [1.0.1] — 2026-09-03
+
+### Added
+- **Customizable auto-type delay:** Delay field (0.2-10.0 s, stepper 0.5 s) next to Auto-type toggle; persisted in `NSUserDefaults` (`CPAutoTypeDelay`), used for `dispatch_after` before `CGEvent` typing. Default 1.0 s.
+- **Advanced pane (slide-out to the right):** Button `Advanced ▶` expands window from 520 to 820 width, showing **Raw Hex (non-encoded, non-hashed, non-truncated)** and **Encoded + Hashed (pre-truncate)** in separate scroll views, with `Copy Raw Hex` / `Copy Encoded` buttons. Accessible via window button, **View → Show Advanced Pane** (⌘⇧A) and **Status Menu → Advanced → Show Raw Hex… / Copy Raw Hex**. Main password field (left) remains unchanged as final truncated output.
+- **Darker, more compact theme:** Window `DarkAqua` appearance, dark `0.13` background, header `0.16`, advanced pane `0.11`; window resized to 520×470 (was 520×500) with tighter 48-pt header and compact bottom bar (Auto-copy/Auto-type + Delay + Advanced on one row). Feels denser, better for OLED.
+- **New app icon:** Smart card with gold stars (password) on dark background, generated for all sizes (16-1024) via `iconutil`, replaces plain card icon.
+
+### Fixed
+- **Tahoe Device Control permission:** `isTrustedForTyping()` now checks `CGPreflightPostEventAccess` (Tahoe’s Device Control) via runtime `dlsym` before `AXIsProcessTrusted`; `requestTypingPermission()` tries `CGRequestPostEventAccess` then fallback. `tahoeSettingsPath` removed (unused). Alerts now correctly say `System Settings → Privacy & Security → Device Control and Data Access` (Tahoe) vs Accessibility (pre-Tahoe) and explain restart needed. Menu titles updated to `Check Auto-Type Permission (Device Control)…` with tooltip `Clipboard copy via ⌘V needs no permission`.
+
+### Changed
+- `README.md` installation/usage now notes delay and advanced pane; `Info.plist` → 1.0.1 (b5).
+
 ## [1.0.0] — 2026-09-03
 
 ### Added

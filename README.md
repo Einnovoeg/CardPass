@@ -68,11 +68,13 @@ The native app has **zero** pip dependencies. `requirements.txt` is only for the
 1. Open **CardPass** — window appears; menu-bar shows “Ready”.
 2. Insert any smart card / SIM / chip card.
 3. Wait for **“Card Read”** — hex appears in window and is copied.
-4. Choose output encoding in the window: **Output:** `Hex` → `Base62` (recommended for passwords, alphanumeric only), `Base58` (human-friendly), `Base64` — then optionally tick **Hash SHA-256** (condenses any card to 32 bytes → 43 Base62 chars, ideal for huge data) and set **Truncate** (e.g. 24 or 16) to fit strict password length limits.
-5. Click into any password field → press **⌘V** to paste (clipboard is instant). If Auto-type is on and Device Control permission is granted, CardPass also auto-types after ~1 s.
-6. Window buttons: **Copy to Clipboard**, **Type into Field**, **Clear**, **Refresh** — all respect the chosen encoding/hash/truncate.
-7. Toggles: **Auto-copy** / **Auto-type** (both on by default). Uncheck **Auto-type** if you only want clipboard — no permission needed.
-8. Menu bar: **Show CardPass Window**, **Type**, **Auto-type ON/OFF**, **Readers detail**, **Check Auto-Type Permission (Device Control)**…, **❤️ Buy Me a Coffee**, **Quit**.
+4. Choose output encoding in the window: **Output:** `Hex` → `Base62` (recommended for passwords, alphanumeric only), `Base58` (human-friendly), `Base64` — then optionally tick **Hash SHA-256** (condenses any card to 32 bytes → 43 Base62 chars, ideal for huge data) and set **Truncate** (e.g. 24 or 16) to fit strict password length limits. Info label shows `23 raw → 31 Base62 → 24`.
+5. Adjust **Delay** (0.2-10 s, default 1.0 s) next to Auto-type — how long to wait before typing, so you can click the target field.
+6. For raw inspection, click **Advanced ▶** (or **View → Show Advanced Pane** / **Status Menu → Advanced → Show Raw Hex…**) — a pane slides out to the right showing **Raw Hex** (exact bytes, non-encoded) and **Encoded + Hashed (pre-truncate)**. Main **Card Data (password)** field (left) stays as final truncated output, unchanged per spec. Raw is also accessible via **View → Show Raw Hex…** sheet.
+7. Click into any password field → press **⌘V** to paste (clipboard is instant). If Auto-type is on and Device Control permission is granted, CardPass also auto-types after the chosen delay.
+8. Window buttons: **Copy to Clipboard**, **Type into Field**, **Clear**, **Refresh** — all respect the chosen encoding/hash/truncate/delay.
+9. Toggles: **Auto-copy** / **Auto-type** (both on by default). Uncheck **Auto-type** if you only want clipboard — no permission needed.
+10. Menu bar: **Show CardPass Window**, **Type**, **Auto-type ON/OFF**, **Readers detail**, **Advanced** (Show Advanced Pane, Raw Hex…), **Check Auto-Type Permission (Device Control)**…, **❤️ Buy Me a Coffee**, **Quit**.
 
 If auto-type does nothing, it’s expected: clipboard still works (⌘V). To enable auto-type, open **System Settings → Privacy & Security → Accessibility** (Tahoe: **Device Control and Data Access**) and enable CardPass, then **quit and reopen CardPass**. Use menu **Check Auto-Type Permission** to verify.
 
@@ -81,11 +83,11 @@ If auto-type does nothing, it’s expected: clipboard still works (⌘V). To ena
 ## Architecture
 
 ```
-CardPass.app (Cocoa, ARC)
- ├─ main.m — AppDelegate, NSWindow (520×500) + NSStatusItem, GCD polling, clipboard/CGEvent, Base62/58/64 + SHA-256 + truncate pipeline
+CardPass.app (Cocoa, ARC, DarkAqua 520×470 + 300 slide-out)
+ ├─ main.m — AppDelegate, NSWindow + NSStatusItem, GCD polling, clipboard/CGEvent, Base62/58/64 + SHA-256 + truncate, delay (0.2-10 s), Advanced pane (raw + pre-truncate, slide-out)
  └─ pcsc_reader.h/c — PC/SC wrapper (thread-safe, system PCSC.framework only)
 deprecated/ — legacy Python (rumps/pyscard) kept locally, not shipped
-Resources/ — AppIcon.icns, icon.png
+Resources/ — AppIcon.icns (card + stars, dark), icon.png
 ```
 
 Polling: 1.5 s timer → `pcsc_list_readers()` on background queue → ATR-change detection → `pcsc_read_card()` per new card → main-queue UI. Handles always-present YubiKeys by reading only when ATR changes.
