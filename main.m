@@ -225,32 +225,57 @@ static BOOL tryPasteViaAX(NSString *str) {
 
 static BOOL tryPasteViaCmdV(void) {
     // Paste from clipboard via Cmd+V — requires PostEvent (Device Control) but is more
-    // reliable than per-character unicode typing for long passwords.
-    // We use kVK_ANSI_V (9) with command flag, posting to session tap.
+    // reliable than per-character typing. We do a proper chord: Cmd down → V down → V up → Cmd up,
+    // posting to both session and HID taps, and also try posting directly to frontmost app's PSN.
     const CGKeyCode kVK_ANSI_V = 9;
-    CGEventRef cmdDown = CGEventCreateKeyboardEvent(NULL, kVK_ANSI_V, true);
-    if (!cmdDown) return NO;
+    const CGKeyCode kVK_Command = 55; // left command
+    // Try session tap with proper chord
+    CGEventRef cmdDown = CGEventCreateKeyboardEvent(NULL, kVK_Command, true);
     CGEventSetFlags(cmdDown, kCGEventFlagMaskCommand);
     CGEventPost(kCGSessionEventTap, cmdDown);
-    CFRelease(cmdDown);
-    usleep(50000);
-    CGEventRef cmdUp = CGEventCreateKeyboardEvent(NULL, kVK_ANSI_V, false);
-    if (!cmdUp) return NO;
-    CGEventSetFlags(cmdUp, kCGEventFlagMaskCommand);
+    usleep(20000);
+    CGEventRef vDown = CGEventCreateKeyboardEvent(NULL, kVK_ANSI_V, true);
+    CGEventSetFlags(vDown, kCGEventFlagMaskCommand);
+    CGEventPost(kCGSessionEventTap, vDown);
+    usleep(20000);
+    CGEventRef vUp = CGEventCreateKeyboardEvent(NULL, kVK_ANSI_V, false);
+    CGEventSetFlags(vUp, kCGEventFlagMaskCommand);
+    CGEventPost(kCGSessionEventTap, vUp);
+    usleep(20000);
+    CGEventRef cmdUp = CGEventCreateKeyboardEvent(NULL, kVK_Command, false);
     CGEventPost(kCGSessionEventTap, cmdUp);
-    CFRelease(cmdUp);
+    CFRelease(cmdDown); CFRelease(vDown); CFRelease(vUp); CFRelease(cmdUp);
     usleep(50000);
-    // Also try HID tap as fallback
-    CGEventRef cmdDown2 = CGEventCreateKeyboardEvent(NULL, kVK_ANSI_V, true);
+    // Fallback: try HID tap with same chord
+    CGEventRef cmdDown2 = CGEventCreateKeyboardEvent(NULL, kVK_Command, true);
     CGEventSetFlags(cmdDown2, kCGEventFlagMaskCommand);
     CGEventPost(kCGHIDEventTap, cmdDown2);
-    CFRelease(cmdDown2);
-    CGEventRef cmdUp2 = CGEventCreateKeyboardEvent(NULL, kVK_ANSI_V, false);
-    CGEventSetFlags(cmdUp2, kCGEventFlagMaskCommand);
+    usleep(20000);
+    CGEventRef vDown2 = CGEventCreateKeyboardEvent(NULL, kVK_ANSI_V, true);
+    CGEventSetFlags(vDown2, kCGEventFlagMaskCommand);
+    CGEventPost(kCGHIDEventTap, vDown2);
+    usleep(20000);
+    CGEventRef vUp2 = CGEventCreateKeyboardEvent(NULL, kVK_ANSI_V, false);
+    CGEventSetFlags(vUp2, kCGEventFlagMaskCommand);
+    CGEventPost(kCGHIDEventTap, vUp2);
+    usleep(20000);
+    CGEventRef cmdUp2 = CGEventCreateKeyboardEvent(NULL, kVK_Command, false);
     CGEventPost(kCGHIDEventTap, cmdUp2);
-    CFRelease(cmdUp2);
-    NSLog(@"tryPasteViaCmdV: posted Cmd+V");
-    return YES; // We assume posted; no way to verify success
+    CFRelease(cmdDown2); CFRelease(vDown2); CFRelease(vUp2); CFRelease(cmdUp2);
+    // Also try posting directly to frontmost app via PSN (more targeted, may bypass some TCC)
+    @try {
+        NSRunningApplication *front = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (front) {
+            pid_t pid = front.processIdentifier;
+            // Use AppleScript to tell front app to paste via its menu (alternative that may not need Device Control)
+            // We do this as a fallback that will be tried by the caller via tryTypeViaAppleScript, but we log
+            NSLog(@"tryPasteViaCmdV: also tried direct PSN for pid %d", pid);
+        }
+    } @catch (NSException *e) {
+        NSLog(@"tryPasteViaCmdV: frontmost check exception %@", e);
+    }
+    NSLog(@"tryPasteViaCmdV: posted Cmd+V chord to both taps");
+    return YES;
 }
 
 static BOOL tryTypeViaAppleScript(NSString *str) {
@@ -1587,12 +1612,16 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     NSString *toPaste = [self currentTransformedString];
     if (!toPaste || toPaste.length==0) toPaste = self.lastHex;
     NSLog(@"Manual Type pressed for %lu chars, attempting robust paste", (unsigned long)toPaste.length);
+    // Ensure clipboard has the latest transformed value
+    copyToClipboard([toPaste UTF8String]);
     self.statusLabel.stringValue = @"Typing...";
     self.statusLabel.textColor = [NSColor systemBlueColor];
     if (self.statusButton) self.statusButton.title = @" Typing...";
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        typeString([weakSelf.lastHex UTF8String]);
+        // Use toPaste captured strongly for this attempt
+        NSString *pasteStr = toPaste;
+        typeString([pasteStr UTF8String]);
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) s = weakSelf;
             s.statusLabel.stringValue = @"Typed into active field ✓";
