@@ -552,6 +552,9 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 @property (assign, nonatomic) double autoTypeDelay;
 @property (strong, nonatomic) NSTextField *delayField;
 @property (strong, nonatomic) NSStepper *delayStepper;
+// Custom text per card (user can set any text to paste instead of card data)
+@property (strong, nonatomic) NSMutableDictionary<NSString*, NSString*> *customMappings;
+@property (copy, nonatomic) NSString *currentCardId;
 // Advanced pane — separate window that slides out to the right (per spec: not just expanding fields)
 @property (strong, nonatomic) NSWindow *advancedWindow;
 @property (strong, nonatomic) NSView *advancedPane;
@@ -580,6 +583,11 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 - (void)encodingChanged:(id)sender;
 - (void)hashToggled:(id)sender;
 - (void)truncateChanged:(id)sender;
+- (void)customTextChanged:(id)sender;
+- (void)saveCustomText:(id)sender;
+- (void)clearCustomText:(id)sender;
+- (NSString *)customTextForCardId:(NSString *)cardId;
+- (NSString *)effectivePasteString;
 - (void)updateTransformedDisplay;
 - (NSString *)currentTransformedString;
 @end
@@ -600,6 +608,9 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     _advancedVisible = NO;
     // Restore user prefs if any
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    _customMappings = [[defaults dictionaryForKey:@"CPCustomMappings"] mutableCopy];
+    if (!_customMappings) _customMappings = [NSMutableDictionary dictionary];
+    _currentCardId = nil;
     NSInteger savedEnc = [defaults integerForKey:@"CPEncoding"];
     if (savedEnc >= 0 && savedEnc <= 3) _selectedEncoding = (CPEncoding)savedEnc;
     _hashEnabled = [defaults boolForKey:@"CPHashEnabled"];
@@ -1103,7 +1114,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     [advContent addSubview:rawLabel];
 
     // Larger raw boxes — show full card data
-    NSScrollView *rawScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 300, 336, 110)];
+    NSScrollView *rawScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 300, 336, 90)];
     rawScroll.hasVerticalScroller = YES;
     rawScroll.borderType = NSBezelBorder;
     rawScroll.drawsBackground = YES;
@@ -1160,7 +1171,41 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     copyPreBtn.action = @selector(copyPreTruncate:);
     [advContent addSubview:copyPreBtn];
 
-    NSTextField *advHint = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 12, 336, 60)];
+    // Custom text for this card — user can set any text to paste instead of card data
+    NSTextField *customLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 58, 336, 12)];
+    customLabel.stringValue = @"Custom text for this card (optional):";
+    customLabel.font = [NSFont systemFontOfSize:10 weight:NSFontWeightSemibold];
+    customLabel.textColor = [NSColor secondaryLabelColor];
+    customLabel.bezeled = NO; customLabel.drawsBackground = NO; customLabel.editable = NO; customLabel.selectable = NO;
+    [advContent addSubview:customLabel];
+
+    NSTextField *customField = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 36, 220, 22)];
+    customField.placeholderString = @"e.g. MySecretPassword123";
+    customField.font = [NSFont systemFontOfSize:11];
+    customField.target = self;
+    customField.action = @selector(customTextChanged:);
+    customField.tag = 1001;
+    [customField setDelegate:(id<NSTextFieldDelegate>)self];
+    [advContent addSubview:customField];
+    // Store reference via tag lookup
+    NSButton *saveCustomBtn = [[NSButton alloc] initWithFrame:NSMakeRect(238, 36, 50, 22)];
+    saveCustomBtn.title = @"Save";
+    saveCustomBtn.bezelStyle = NSBezelStyleRounded;
+    saveCustomBtn.font = [NSFont systemFontOfSize:11];
+    saveCustomBtn.target = self;
+    saveCustomBtn.action = @selector(saveCustomText:);
+    saveCustomBtn.tag = 1002;
+    [advContent addSubview:saveCustomBtn];
+
+    NSButton *clearCustomBtn = [[NSButton alloc] initWithFrame:NSMakeRect(292, 36, 44, 22)];
+    clearCustomBtn.title = @"Clear";
+    clearCustomBtn.bezelStyle = NSBezelStyleRounded;
+    clearCustomBtn.font = [NSFont systemFontOfSize:11];
+    clearCustomBtn.target = self;
+    clearCustomBtn.action = @selector(clearCustomText:);
+    [advContent addSubview:clearCustomBtn];
+
+    NSTextField *advHint = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 12, 336, 20)];
     advHint.stringValue = @"Raw Hex is the exact bytes from the card (hex). Encoded shows the result after Base62/58/64 + SHA-256 but before truncation. Main password field (left window) is the final truncated output and is intentionally compact.";
     advHint.font = [NSFont systemFontOfSize:10];
     advHint.textColor = [NSColor secondaryLabelColor];
@@ -1478,10 +1523,19 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
             raw = [hex dataUsingEncoding:NSUTF8StringEncoding];
         }
         self.lastRawData = raw;
+        // Use raw hex as card identifier for custom mapping (stable, unique per card)
+        self.currentCardId = hex; // hex is the raw hex from card
         self.lastHex = hex; // keep original for reference; transformed shown in view
         self.lastAtrHex = hexForAtr((unsigned char*)"",0); // not used
 
-        // Compute transformed password and show it (Base62/hash/truncate)
+        // If user set a custom text for this card, populate the advanced field
+        NSString *custom = [self customTextForCardId:self.currentCardId];
+        NSTextField *customField = (NSTextField *)[self.advancedWindow.contentView viewWithTag:1001];
+        if (customField) {
+            customField.stringValue = custom ?: @"";
+            customField.placeholderString = custom ? @"" : @"e.g. MySecretPassword123";
+        }
+        // Compute transformed password and show it (Base62/hash/truncate) — but if custom exists, effectivePaste will use it
         [self updateTransformedDisplay];
         self.hexTextView.textColor = [NSColor labelColor];
         self.statusLabel.stringValue = [NSString stringWithFormat:@"Card read ✓  (%@)", name];
@@ -1501,14 +1555,14 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
         self.clipboardBtn.enabled = YES;
         self.typeButton.enabled = YES;
 
-        NSString *transformed = [self currentTransformedString];
+        NSString *effective = [self effectivePasteString];
         if (self.autoCopyCheck.state == NSControlStateValueOn) {
-            copyToClipboard([transformed UTF8String]);
-            NSLog(@"Auto-copied %lu chars (raw %lu hex) via enc %ld hash:%@ trunc:%ld", (unsigned long)transformed.length, (unsigned long)hex.length, (long)self.selectedEncoding, self.hashEnabled?@"YES":@"NO", (long)self.truncateLength);
+            copyToClipboard([effective UTF8String]);
+            NSLog(@"Auto-copied %lu chars (effective, raw %lu hex) via enc %ld hash:%@ trunc:%ld custom:%@", (unsigned long)effective.length, (unsigned long)hex.length, (long)self.selectedEncoding, self.hashEnabled?@"YES":@"NO", (long)self.truncateLength, [self customTextForCardId:self.currentCardId] ? @"YES" : @"NO");
         }
 
         BOOL autoType = (self.autoTypeCheck.state == NSControlStateValueOn);
-        if (autoType && transformed.length > 0) {
+        if (autoType && effective.length > 0) {
             // Auto-type is now attempted *without* pre-checking trust — we try all
             // paste methods (AX, Cmd+V, AppleScript, per-char) and only show a
             // gentle fallback if everything fails. This fixes the Tahoe case where
@@ -1530,9 +1584,10 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(self.autoTypeDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 if (!self.lastHex || self.lastHex.length==0) return;
-                NSString *toPaste = [self currentTransformedString];
+                NSString *toPaste = [self effectivePasteString];
+                if (!toPaste || toPaste.length==0) toPaste = [self currentTransformedString];
                 if (!toPaste || toPaste.length==0) toPaste = self.lastHex;
-                NSLog(@"Auto-type attempting robust paste for %lu chars", (unsigned long)toPaste.length);
+                NSLog(@"Auto-type attempting robust paste for %lu chars (custom:%@)", (unsigned long)toPaste.length, [self customTextForCardId:self.currentCardId] ? @"YES" : @"NO");
                 // typeString now tries AX → Cmd+V → AppleScript → per-char without pre-check
                 typeString([toPaste UTF8String]);
                 // Assume paste was attempted; show success and return to Ready.
@@ -1584,11 +1639,13 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 }
 
 - (void)copyHex:(id)sender {
-    if (self.lastHex.length == 0) {
+    NSString *toCopy = [self effectivePasteString];
+    if (!toCopy || toCopy.length==0) toCopy = self.lastHex;
+    if (toCopy.length == 0) {
         NSBeep();
         return;
     }
-    copyToClipboard([self.lastHex UTF8String]);
+    copyToClipboard([toCopy UTF8String]);
     NSString *prev = self.statusLabel.stringValue;
     self.statusLabel.stringValue = @"Copied to clipboard ✓";
     self.statusLabel.textColor = [NSColor systemGreenColor];
@@ -1606,13 +1663,12 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 }
 
 - (void)typeHex:(id)sender {
-    if (self.lastHex.length == 0) { NSBeep(); return; }
-    // Try robust paste without pre-checking trust — typeString tries AX → Cmd+V → AppleScript → per-char
-    // and always leaves clipboard ready for manual ⌘V. Only show permission hint if user explicitly asks.
-    NSString *toPaste = [self currentTransformedString];
+    NSString *toPaste = [self effectivePasteString];
+    if (!toPaste || toPaste.length==0) toPaste = [self currentTransformedString];
     if (!toPaste || toPaste.length==0) toPaste = self.lastHex;
-    NSLog(@"Manual Type pressed for %lu chars, attempting robust paste", (unsigned long)toPaste.length);
-    // Ensure clipboard has the latest transformed value
+    if (toPaste.length == 0) { NSBeep(); return; }
+    NSLog(@"Manual Type pressed for %lu chars (custom:%@), attempting robust paste", (unsigned long)toPaste.length, [self customTextForCardId:self.currentCardId] ? @"YES" : @"NO");
+    // Ensure clipboard has the latest effective value
     copyToClipboard([toPaste UTF8String]);
     self.statusLabel.stringValue = @"Typing...";
     self.statusLabel.textColor = [NSColor systemBlueColor];
@@ -1716,6 +1772,59 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.autoTypeDelay = val;
     [[NSUserDefaults standardUserDefaults] setDouble:self.autoTypeDelay forKey:@"CPAutoTypeDelay"];
     NSLog(@"Delay set to %.1f s", self.autoTypeDelay);
+}
+
+- (NSString *)customTextForCardId:(NSString *)cardId {
+    if (!cardId || cardId.length==0) return nil;
+    return self.customMappings[cardId];
+}
+
+- (NSString *)effectivePasteString {
+    // If user set a custom text for this card, use it; otherwise use transformed
+    NSString *custom = [self customTextForCardId:self.currentCardId];
+    if (custom && custom.length>0) {
+        NSLog(@"effectivePaste: using custom for %@ (%lu chars)", self.currentCardId, (unsigned long)custom.length);
+        return custom;
+    }
+    return [self currentTransformedString];
+}
+
+- (void)customTextChanged:(id)sender {
+    // Live update as user types, but not yet saved
+    NSTextField *field = (NSTextField *)[self.advancedWindow.contentView viewWithTag:1001];
+    if (!field) field = (NSTextField *)sender;
+    NSString *txt = [field stringValue];
+    NSLog(@"customTextChanged: %@ (%lu)", txt, (unsigned long)txt.length);
+    // Don't auto-save; user must click Save
+}
+
+- (void)saveCustomText:(id)sender {
+    if (!self.currentCardId) {
+        NSAlert *a = [[NSAlert alloc] init];
+        a.messageText = @"No Card Yet";
+        a.informativeText = @"Insert a card first to set its custom text. The custom text is tied to that card's raw hex.";
+        [a addButtonWithTitle:@"OK"];
+        [a beginSheetModalForWindow:self.advancedWindow ?: self.mainWindow completionHandler:nil];
+        return;
+    }
+    NSTextField *field = (NSTextField *)[self.advancedWindow.contentView viewWithTag:1001];
+    NSString *txt = [[field stringValue] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (txt.length==0) {
+        [self.customMappings removeObjectForKey:self.currentCardId];
+    } else {
+        self.customMappings[self.currentCardId] = txt;
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:self.customMappings forKey:@"CPCustomMappings"];
+    NSLog(@"saveCustomText: for %@ -> %@ (%lu)", self.currentCardId, txt, (unsigned long)txt.length);
+    [self updateTransformedDisplay];
+    self.statusLabel.stringValue = txt.length>0 ? [NSString stringWithFormat:@"Custom text saved for this card (%lu chars) ✓", (unsigned long)txt.length] : @"Custom text cleared";
+    self.statusLabel.textColor = [NSColor systemGreenColor];
+}
+
+- (void)clearCustomText:(id)sender {
+    NSTextField *field = (NSTextField *)[self.advancedWindow.contentView viewWithTag:1001];
+    field.stringValue = @"";
+    [self saveCustomText:sender];
 }
 
 - (void)toggleAdvancedPane:(id)sender {
@@ -1837,6 +1946,9 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
             self.hexTextView.string = @"No card data yet — insert a card to read";
             self.hexTextView.textColor = [NSColor secondaryLabelColor];
             self.encodingInfoLabel.stringValue = @"";
+            // Clear advanced custom field if no card
+            NSTextField *customField = (NSTextField *)[self.advancedWindow.contentView viewWithTag:1001];
+            if (customField) customField.stringValue = @"";
             return;
         }
         // Legacy lastHex without raw — try to derive raw
@@ -1844,23 +1956,42 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
         if (raw) self.lastRawData = raw;
     }
     NSString *transformed = [self currentTransformedString];
-    // Keep lastHex as the *transformed* password for copy/type
-    self.lastHex = transformed;
-    self.hexTextView.string = transformed.length > 0 ? transformed : @"(empty — check encoding settings)";
-    self.hexTextView.textColor = transformed.length > 0 ? [NSColor labelColor] : [NSColor secondaryLabelColor];
+    NSString *effective = [self effectivePasteString];
+    BOOL isCustom = (self.currentCardId && [self customTextForCardId:self.currentCardId] != nil);
+    // Keep lastHex as the *effective* password for copy/type (custom takes precedence)
+    self.lastHex = effective;
+    if (isCustom) {
+        self.hexTextView.string = effective;
+        self.hexTextView.textColor = [NSColor systemPurpleColor];
+    } else {
+        self.hexTextView.string = transformed.length > 0 ? transformed : @"(empty — check encoding settings)";
+        self.hexTextView.textColor = transformed.length > 0 ? [NSColor labelColor] : [NSColor secondaryLabelColor];
+    }
 
-    // Update info label: show e.g. "43 chars (B62+hash)" or truncated note
+    // Update custom field in advanced window
+    NSTextField *customField = (NSTextField *)[self.advancedWindow.contentView viewWithTag:1001];
+    if (customField) {
+        NSString *custom = [self customTextForCardId:self.currentCardId];
+        // Only update if field is not first responder (user not actively editing)
+        if (customField != [self.advancedWindow firstResponder]) {
+            customField.stringValue = custom ?: @"";
+        }
+    }
+
+    // Update info label: show e.g. "43 chars (B62+hash)" or truncated note, plus custom note
     NSString *encName = @[@"Hex",@"Base62",@"Base58",@"Base64"][(NSInteger)self.selectedEncoding];
     NSString *hashNote = self.hashEnabled ? @"+SHA256" : @"";
     NSString *truncNote = self.truncateLength > 0 ? [NSString stringWithFormat:@" → %ld chars", (long)self.truncateLength] : @"";
+    NSString *customNote = isCustom ? @" (custom)" : @"";
     NSString *info = @"";
     if (self.lastRawData) {
         NSUInteger rawLen = self.lastRawData.length;
         if (self.hashEnabled) {
-            info = [NSString stringWithFormat:@"%lu raw → 32 hash → %lu %@%@%@", (unsigned long)rawLen, (unsigned long)transformed.length, encName, hashNote, truncNote];
+            info = [NSString stringWithFormat:@"%lu raw → 32 hash → %lu %@%@%@%@", (unsigned long)rawLen, (unsigned long)effective.length, encName, hashNote, truncNote, customNote];
         } else {
-            info = [NSString stringWithFormat:@"%lu raw → %lu %@%@", (unsigned long)rawLen, (unsigned long)transformed.length, encName, truncNote];
+            info = [NSString stringWithFormat:@"%lu raw → %lu %@%@%@", (unsigned long)rawLen, (unsigned long)effective.length, encName, truncNote, customNote];
         }
+        if (isCustom) info = [info stringByAppendingString:@" — using custom text"];
     } else {
         info = [NSString stringWithFormat:@"%lu %@%@%@", (unsigned long)transformed.length, encName, hashNote, truncNote];
     }
