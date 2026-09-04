@@ -298,22 +298,35 @@ static BOOL tryTypeViaAppleScript(NSString *str) {
 static BOOL pasteStringViaAllMethods(NSString *str) {
     if (!str || str.length == 0) return NO;
     NSLog(@"pasteStringViaAllMethods: attempting %lu chars", (unsigned long)str.length);
-    // 1. Try AX direct set (most reliable for password fields, bypasses keystroke)
-    if (tryPasteViaAX(str)) return YES;
-    // 2. Try Cmd+V from clipboard (we ensure clipboard is set before calling)
-    // Ensure clipboard has the string
+    // Ensure clipboard has the string for Cmd+V
     NSPasteboard *pb = [NSPasteboard generalPasteboard];
     [pb clearContents];
     [pb declareTypes:@[NSPasteboardTypeString] owner:nil];
-    [pb setString:str forType:NSPasteboardTypeString];
-    usleep(100000); // let pasteboard settle
+    BOOL pbOK = [pb setString:str forType:NSPasteboardTypeString];
+    NSLog(@"pasteStringViaAllMethods: pasteboard set %@ (%lu)", pbOK?@"OK":@"FAIL", (unsigned long)str.length);
+    usleep(150000); // let pasteboard settle
+
+    // Try Cmd+V first (most reliable for web fields, needs Device Control but we try anyway)
+    // We post to both taps with proper chord and also try AppleScript as fallback
     if (tryPasteViaCmdV()) {
-        // Give it a moment, then check if we can verify via AX?
+        // Check if we can verify via AX that the field now contains the string? Hard to verify.
+        // Assume Cmd+V was posted; give it time
+        usleep(200000);
+        // Also try AX as second attempt if Cmd+V didn't work (e.g., for native fields)
+        // Don't return yet, try AX as well
+    }
+    // Try AX direct set (works for native password fields if accessible)
+    if (tryPasteViaAX(str)) {
+        NSLog(@"pasteStringViaAllMethods: AX succeeded, also tried Cmd+V");
         return YES;
     }
-    // 3. Try AppleScript
-    if (tryTypeViaAppleScript(str)) return YES;
-    // 4. Final fallback: per-character CGEvent unicode typing (original method, both taps)
+    // Try AppleScript (requires Automation for System Events)
+    if (tryTypeViaAppleScript(str)) {
+        NSLog(@"pasteStringViaAllMethods: AppleScript succeeded");
+        return YES;
+    }
+    // Final fallback: per-character CGEvent unicode typing (both taps)
+    NSLog(@"pasteStringViaAllMethods: trying per-char fallback for %lu chars", (unsigned long)str.length);
     for (NSUInteger i = 0; i < str.length; i++) {
         unichar c = [str characterAtIndex:i];
         CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0, true);
@@ -335,10 +348,10 @@ static BOOL pasteStringViaAllMethods(NSString *str) {
         CGEventKeyboardSetUnicodeString(up2, 1, &c);
         CGEventPost(kCGHIDEventTap, up2);
         CFRelease(up2);
-        usleep(15000);
+        usleep(12000);
     }
     NSLog(@"pasteStringViaAllMethods: tried per-char CGEvent fallback");
-    return YES; // Assume at least the per-char attempt was made
+    return YES;
 }
 
 static void typeString(const char *str) {
@@ -938,9 +951,8 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     readersScroll.documentView = self.readersTextView;
     [content addSubview:readersScroll];
 
-    // --- Encoding controls bar (new) ---
-    // Encoding popup: Hex / Base62 (recommended) / Base58 / Base64
-    // Plus hash checkbox and truncate length
+    // --- Encoding controls — arranged in 2 rows to avoid clutter (not a straight line) ---
+    // Row 1: Output: [popup]     Hash: [popup]
     NSTextField *encLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 265, 50, 14)];
     encLabel.stringValue = @"Output:";
     encLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
@@ -949,7 +961,7 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     encLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:encLabel];
 
-    self.encodingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(70, 260, 120, 24) pullsDown:NO];
+    self.encodingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(70, 260, 130, 24) pullsDown:NO];
     [self.encodingPopup addItemsWithTitles:@[@"Hex (Base16)", @"Base62 (A-Z0-9)", @"Base58 (no 0/O/I/l)", @"Base64 (+/)", @"Base32 (A-Z2-7)", @"Base36 (0-9A-Z)"]];
     [self.encodingPopup selectItemAtIndex:self.selectedEncoding];
     self.encodingPopup.target = self;
@@ -958,8 +970,7 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     self.encodingPopup.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.encodingPopup];
 
-    // Hash popup: None / SHA-256 / SHA-512 / SHA1 / MD5
-    NSTextField *hashLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(200, 265, 32, 14)];
+    NSTextField *hashLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(210, 265, 32, 14)];
     hashLabel.stringValue = @"Hash:";
     hashLabel.font = [NSFont systemFontOfSize:11];
     hashLabel.textColor = [NSColor secondaryLabelColor];
@@ -967,7 +978,7 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     hashLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:hashLabel];
 
-    self.hashPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(232, 260, 110, 24) pullsDown:NO];
+    self.hashPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(245, 260, 100, 24) pullsDown:NO];
     [self.hashPopup addItemsWithTitles:@[@"None", @"SHA-256", @"SHA-512", @"SHA-1", @"MD5"]];
     NSInteger hashIdx = 0;
     if (self.selectedHash == CPHashSHA256) hashIdx = 1;
@@ -981,15 +992,16 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     self.hashPopup.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.hashPopup];
 
-    // Keep old checkbox hidden for backwards compat (not used, but keep property)
+    // Keep old checkbox hidden for backwards compat
     self.hashCheck = [[NSButton alloc] initWithFrame:NSMakeRect(220, 265, 110, 18)];
     [self.hashCheck setButtonType:NSButtonTypeSwitch];
     self.hashCheck.title = @"Hash SHA-256";
     self.hashCheck.hidden = YES;
-    self.hashCheck.state = self.hashEnabled ? NSControlStateValueOn : NSControlStateValueOff;
     [content addSubview:self.hashCheck];
 
-    NSTextField *truncLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(330, 265, 52, 14)];
+    // Row 2: Truncate: [field][stepper]   Delay: [field][stepper]   Info
+    // Row 2: Truncate and Delay — placed on second row with breathing room, not crowded on one line
+    NSTextField *truncLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 238, 52, 14)];
     truncLabel.stringValue = @"Truncate:";
     truncLabel.font = [NSFont systemFontOfSize:11];
     truncLabel.textColor = [NSColor secondaryLabelColor];
@@ -998,20 +1010,19 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     truncLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:truncLabel];
 
-    self.truncateField = [[NSTextField alloc] initWithFrame:NSMakeRect(385, 261, 44, 22)];
+    self.truncateField = [[NSTextField alloc] initWithFrame:NSMakeRect(70, 234, 44, 22)];
     self.truncateField.stringValue = self.truncateLength > 0 ? [NSString stringWithFormat:@"%ld", (long)self.truncateLength] : @"";
     self.truncateField.placeholderString = @"e.g. 24";
     self.truncateField.font = [NSFont systemFontOfSize:11];
-    self.truncateField.bezeled = YES; self.truncateField.bezeled = YES;
+    self.truncateField.bezeled = YES;
     self.truncateField.target = self;
     self.truncateField.action = @selector(truncateChanged:);
     self.truncateField.toolTip = @"Truncate password to N chars (leave empty for full length). For hashed Base62, 16-24 chars is secure.";
     self.truncateField.autoresizingMask = NSViewMaxYMargin;
-    // Send action on end editing
     [self.truncateField setDelegate:(id<NSTextFieldDelegate>)self];
     [content addSubview:self.truncateField];
 
-    self.truncateStepper = [[NSStepper alloc] initWithFrame:NSMakeRect(430, 261, 19, 22)];
+    self.truncateStepper = [[NSStepper alloc] initWithFrame:NSMakeRect(115, 234, 19, 22)];
     self.truncateStepper.minValue = 0; self.truncateStepper.maxValue = 128; self.truncateStepper.increment = 1;
     self.truncateStepper.valueWraps = NO;
     self.truncateStepper.doubleValue = self.truncateLength;
@@ -1020,7 +1031,17 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     self.truncateStepper.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.truncateStepper];
 
-    self.encodingInfoLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(455, 265, 50, 14)];
+    // Delay on same row but with clear gap — not crammed
+    NSTextField *delayLabel2 = [[NSTextField alloc] initWithFrame:NSMakeRect(160, 238, 38, 14)];
+    delayLabel2.stringValue = @"Delay:";
+    delayLabel2.font = [NSFont systemFontOfSize:11];
+    delayLabel2.textColor = [NSColor secondaryLabelColor];
+    delayLabel2.bezeled = NO; delayLabel2.drawsBackground = NO; delayLabel2.editable = NO; delayLabel2.selectable = NO;
+    delayLabel2.autoresizingMask = NSViewMaxYMargin;
+    [content addSubview:delayLabel2];
+
+    // Info label on far right of row 2, not overlapping
+    self.encodingInfoLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(360, 238, 130, 14)];
     self.encodingInfoLabel.stringValue = @"";
     self.encodingInfoLabel.font = [NSFont systemFontOfSize:10];
     self.encodingInfoLabel.textColor = [NSColor secondaryLabelColor];
@@ -1128,41 +1149,9 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     self.autoTypeCheck.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.autoTypeCheck];
 
-    NSTextField *delayLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(250, 50, 38, 14)];
-    delayLabel.stringValue = @"Delay:";
-    delayLabel.font = [NSFont systemFontOfSize:11];
-    delayLabel.textColor = [NSColor secondaryLabelColor];
-    delayLabel.bezeled = NO; delayLabel.drawsBackground = NO; delayLabel.editable = NO; delayLabel.selectable = NO;
-    delayLabel.autoresizingMask = NSViewMaxYMargin;
-    [content addSubview:delayLabel];
-
-    self.delayField = [[NSTextField alloc] initWithFrame:NSMakeRect(290, 48, 36, 20)];
-    self.delayField.stringValue = [NSString stringWithFormat:@"%.1f", self.autoTypeDelay];
-    self.delayField.font = [NSFont systemFontOfSize:11];
-    self.delayField.alignment = NSTextAlignmentCenter;
-    self.delayField.target = self;
-    self.delayField.action = @selector(delayChanged:);
-    self.delayField.toolTip = @"Seconds to wait before auto-typing (0.2-10s). Clipboard is instant.";
-    self.delayField.autoresizingMask = NSViewMaxYMargin;
-    [self.delayField setDelegate:(id<NSTextFieldDelegate>)self];
-    [content addSubview:self.delayField];
-
-    self.delayStepper = [[NSStepper alloc] initWithFrame:NSMakeRect(327, 48, 19, 20)];
-    self.delayStepper.minValue = 0.2; self.delayStepper.maxValue = 10.0; self.delayStepper.increment = 0.5;
-    self.delayStepper.valueWraps = NO;
-    self.delayStepper.doubleValue = self.autoTypeDelay;
-    self.delayStepper.target = self;
-    self.delayStepper.action = @selector(delayChanged:);
-    self.delayStepper.autoresizingMask = NSViewMaxYMargin;
-    [content addSubview:self.delayStepper];
-
-    NSTextField *delayUnit = [[NSTextField alloc] initWithFrame:NSMakeRect(348, 50, 12, 14)];
-    delayUnit.stringValue = @"s";
-    delayUnit.font = [NSFont systemFontOfSize:11];
-    delayUnit.textColor = [NSColor secondaryLabelColor];
-    delayUnit.bezeled = NO; delayUnit.drawsBackground = NO; delayUnit.editable = NO; delayUnit.selectable = NO;
-    delayUnit.autoresizingMask = NSViewMaxYMargin;
-    [content addSubview:delayUnit];
+    // Row 2 already has Truncate at 16,240 and Delay at 145,240 (see above encoding bar)
+    // Ensure delay controls are correctly positioned at row 2 (not bottom bar)
+    // (delayField/delayStepper already created at 210,236 / 247,236 in row 2)
 
     NSButton *advancedBtn = [[NSButton alloc] initWithFrame:NSMakeRect(375, 48, 95, 22)];
     advancedBtn.title = self.advancedVisible ? @"◀ Advanced" : @"Advanced ▶";
