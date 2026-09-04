@@ -21,8 +21,9 @@
  *  Security:
  *    - No card data is written to disk or logged beyond length counts.
  *    - Buffers are bounded (hex_data 1025, error 256). All C strings are NUL-checked.
- *    - Typing aborts if Accessibility is not trusted and prompts the user to
- *      enable System Settings → Privacy & Security → Accessibility.
+ *    - Clipboard copy needs no permission; auto-type optionally needs
+ *      System Settings → Privacy & Security → Accessibility
+ *      (Tahoe: Device Control and Data Access) and degrades gracefully to ⌘V paste.
  *    - Polling and SCardGetStatusChange use bounded timeouts to avoid spin.
  *
  *  Build:
@@ -82,13 +83,44 @@ static void copyToClipboard(const char *str) {
 }
 
 static BOOL isTrustedForTyping(void) {
+    // On macOS 15 and earlier this checks Accessibility; on Tahoe (27) the same
+    // API maps to Device Control and Data Access. We deliberately use NO prompt
+    // for polling so we don't spam the user, and YES prompt only when user
+    // explicitly asks to enable typing.
     NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @NO};
     return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
 }
 
+static void openPrivacySettingsDirectly(void) {
+    // Try to open the correct Privacy pane directly. On Tahoe the toggle moved
+    // from Accessibility to Device Control and Data Access. Try several URLs;
+    // the system will ignore unknown ones.
+    NSArray<NSString*> *candidates = @[
+        @"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
+        @"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DeviceControl",
+        @"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        @"x-apple.systempreferences:com.apple.preference.security?Privacy"
+    ];
+    for (NSString *s in candidates) {
+        NSURL *u = [NSURL URLWithString:s];
+        if (u && [[NSWorkspace sharedWorkspace] openURL:u]) {
+            // Give System Settings a moment to open; don't try all at once.
+            // Only try first successful one.
+            break;
+        }
+    }
+}
+
 static void requestTypingPermission(void) {
+    // First, let the system show its standard prompt (this is the Apple-sanctioned
+    // flow and will open the *correct* pane for the current OS). Then also try
+    // the direct URLs as fallback for betas where the prompt lands in the wrong place.
     NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
-    AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+    BOOL wasTrusted = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+    if (!wasTrusted) {
+        // Fallback: try to open Privacy panes directly (helps on Tahoe betas)
+        openPrivacySettingsDirectly();
+    }
 }
 
 static void typeString(const char *str) {
@@ -225,8 +257,9 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     showWinItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
     [appMenu addItem:showWinItem];
 
-    NSMenuItem *prefsItem = [[NSMenuItem alloc] initWithTitle:@"Check Accessibility Permission..." action:@selector(checkAccessibility:) keyEquivalent:@""];
+    NSMenuItem *prefsItem = [[NSMenuItem alloc] initWithTitle:@"Check Auto-Type Permission…" action:@selector(checkAccessibility:) keyEquivalent:@""];
     prefsItem.target = self;
+    prefsItem.toolTip = @"Auto-type needs Device Control / Accessibility — clipboard always works without it";
     [appMenu addItem:prefsItem];
 
     [appMenu addItem:[NSMenuItem separatorItem]];
@@ -391,8 +424,8 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     hexLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:hexLabel];
 
-    NSTextField *hexHint = [[NSTextField alloc] initWithFrame:NSMakeRect(130, 224, 300, 12)];
-    hexHint.stringValue = @"— copied to clipboard, auto-types into password field";
+     NSTextField *hexHint = [[NSTextField alloc] initWithFrame:NSMakeRect(130, 224, 300, 12)];
+    hexHint.stringValue = @"— copied to clipboard, auto-type is optional (needs Device Control)";
     hexHint.font = [NSFont systemFontOfSize:10];
     hexHint.textColor = [NSColor secondaryLabelColor];
     hexHint.bezeled = NO; hexHint.drawsBackground = NO; hexHint.editable = NO; hexHint.selectable = NO;
@@ -571,8 +604,9 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
 
     [self.statusMenu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem *accItem = [[NSMenuItem alloc] initWithTitle:@"Check Accessibility Permission..." action:@selector(checkAccessibility:) keyEquivalent:@""];
+    NSMenuItem *accItem = [[NSMenuItem alloc] initWithTitle:@"Check Auto-Type Permission (Device Control)…" action:@selector(checkAccessibility:) keyEquivalent:@""];
     accItem.target = self;
+    accItem.toolTip = @"Clipboard copy via ⌘V needs no permission; auto-type is optional";
     [self.statusMenu addItem:accItem];
 
     NSMenuItem *coffeeStatus = [[NSMenuItem alloc] initWithTitle:@"❤️ Buy Me a Coffee" action:@selector(openBuyMeACoffee:) keyEquivalent:@""];
@@ -796,43 +830,61 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
 
         BOOL autoType = (self.autoTypeCheck.state == NSControlStateValueOn);
         if (autoType && hex.length > 0) {
-            self.statusLabel.stringValue = [NSString stringWithFormat:@"Typing in 1s… (%@)", name];
-            self.statusLabel.textColor = [NSColor systemBlueColor];
-            if (self.statusButton) self.statusButton.title = @" Typing...";
-
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (!self.lastHex || self.lastHex.length==0) return;
-                if (!isTrustedForTyping()) {
-                    NSAlert *a = [[NSAlert alloc] init];
-                    a.messageText = @"Accessibility Permission Needed";
-                    a.informativeText = @"CardPass needs Accessibility access to type into password fields.\n\nOpen System Settings → Privacy & Security → Accessibility and enable CardPass, then try again.";
-                    [a addButtonWithTitle:@"Open Settings"];
-                    [a addButtonWithTitle:@"Cancel"];
-                    NSModalResponse r = [a runModal];
-                    if (r == NSAlertFirstButtonReturn) requestTypingPermission();
-                    self.statusLabel.stringValue = @"Ready — permission needed to auto-type";
-                    self.statusLabel.textColor = [NSColor systemOrangeColor];
-                    if (self.statusButton) self.statusButton.title = @" Need Permission";
-                    return;
-                }
-                typeString([self.lastHex UTF8String]);
-                NSLog(@"Auto-typed %lu chars", (unsigned long)self.lastHex.length);
-                self.statusLabel.stringValue = @"Ready — typed into active field";
+            // Auto-type is optional — clipboard already done. If not trusted we
+            // simply fall back to clipboard + manual paste, without blocking the UI.
+            if (!isTrustedForTyping()) {
+                NSLog(@"Auto-type skipped: not trusted for Device Control/Accessibility — clipboard already ready (press Cmd+V to paste)");
+                self.statusLabel.stringValue = @"Copied ✓ — press ⌘V to paste (enable Device Control for auto-type)";
                 self.statusLabel.textColor = [NSColor systemGreenColor];
-                if (self.statusButton) self.statusButton.title = @" Ready";
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (self.statusButton) {
+                    NSString *p = [[NSBundle mainBundle] pathForResource:@"AppIcon" ofType:@"icns"];
+                    NSImage *ic = p ? [[NSImage alloc] initWithContentsOfFile:p] : nil;
+                    if (ic) { ic.size = NSMakeSize(18,18); self.statusButton.image = ic; self.statusButton.title = @" Ready"; }
+                    else self.statusButton.title = @"Ready";
+                }
+                // Return to normal Ready after a few seconds, but don't lock on "Need Permission"
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     self.statusLabel.stringValue = @"Ready — insert a card";
-                    if (self.statusButton) {
-                        NSString *p = [[NSBundle mainBundle] pathForResource:@"AppIcon" ofType:@"icns"];
-                        NSImage *ic = p ? [[NSImage alloc] initWithContentsOfFile:p] : nil;
-                        if (ic) { ic.size = NSMakeSize(18,18); self.statusButton.image = ic; self.statusButton.title = @" Ready"; }
-                        else self.statusButton.title = @"CardPass Ready";
-                    }
+                    self.statusLabel.textColor = [NSColor systemGreenColor];
                 });
-            });
+                // Note: user can still enable auto-type via menu → Check Device Control Permission.
+                // We don't auto-popup the permission dialog on every scan — that was the bug.
+            } else {
+                self.statusLabel.stringValue = [NSString stringWithFormat:@"Typing in 1s… (%@)", name];
+                self.statusLabel.textColor = [NSColor systemBlueColor];
+                if (self.statusButton) self.statusButton.title = @" Typing...";
+
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    if (!self.lastHex || self.lastHex.length==0) return;
+                    // Double-check trust just before typing (user may have revoked)
+                    if (!isTrustedForTyping()) {
+                        NSLog(@"Auto-type aborted at type time: trust revoked");
+                        self.statusLabel.stringValue = @"Copied ✓ — auto-type needs Device Control (press ⌘V)";
+                        self.statusLabel.textColor = [NSColor systemOrangeColor];
+                        if (self.statusButton) self.statusButton.title = @" Ready";
+                        return;
+                    }
+                    typeString([self.lastHex UTF8String]);
+                    NSLog(@"Auto-typed %lu chars", (unsigned long)self.lastHex.length);
+                    self.statusLabel.stringValue = @"Ready — typed into active field";
+                    self.statusLabel.textColor = [NSColor systemGreenColor];
+                    if (self.statusButton) self.statusButton.title = @" Ready";
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        self.statusLabel.stringValue = @"Ready — insert a card";
+                        if (self.statusButton) {
+                            NSString *p = [[NSBundle mainBundle] pathForResource:@"AppIcon" ofType:@"icns"];
+                            NSImage *ic = p ? [[NSImage alloc] initWithContentsOfFile:p] : nil;
+                            if (ic) { ic.size = NSMakeSize(18,18); self.statusButton.image = ic; self.statusButton.title = @" Ready"; }
+                            else self.statusButton.title = @"CardPass Ready";
+                        }
+                    });
+                });
+            }
         } else {
             if (self.autoCopyCheck.state == NSControlStateValueOn) {
-                self.statusLabel.stringValue = @"Copied to clipboard — ready";
+                self.statusLabel.stringValue = @"Copied to clipboard — ready (press ⌘V to paste)";
+            } else {
+                self.statusLabel.stringValue = @"Ready — insert a card";
             }
         }
 
@@ -879,13 +931,26 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
 
 - (void)typeHex:(id)sender {
     if (self.lastHex.length == 0) { NSBeep(); return; }
+    // Auto-type requires Device Control / Accessibility. But clipboard paste
+    // via ⌘V always works without it, so we offer that as fallback.
     if (!isTrustedForTyping()) {
         NSAlert *a = [[NSAlert alloc] init];
-        a.messageText = @"Accessibility Permission Needed";
-        a.informativeText = @"CardPass needs Accessibility access to type.\n\nGo to System Settings → Privacy & Security → Accessibility and add/enable CardPass.";
+        a.messageText = @"Auto-Type Needs Device Control Permission";
+        a.informativeText = @"CardPass can’t auto-type without permission, but clipboard copy always works.\n\n"
+                             "• ✅ Clipboard: already copied — just press ⌘V to paste into any field.\n"
+                             "• For auto-type: open System Settings → Privacy & Security → Accessibility (or Device Control and Data Access on Tahoe) and enable CardPass, then restart CardPass.\n\n"
+                             "Tip: If the toggle is already on and this still appears, quit and reopen CardPass.";
         [a addButtonWithTitle:@"Open Settings"];
+        [a addButtonWithTitle:@"Copy Again"];
         [a addButtonWithTitle:@"Cancel"];
-        if ([a runModal] == NSAlertFirstButtonReturn) requestTypingPermission();
+        NSModalResponse r = [a runModal];
+        if (r == NSAlertFirstButtonReturn) {
+            requestTypingPermission();
+        } else if (r == NSAlertSecondButtonReturn) {
+            copyToClipboard([self.lastHex UTF8String]);
+            self.statusLabel.stringValue = @"Copied — press ⌘V to paste";
+            self.statusLabel.textColor = [NSColor systemGreenColor];
+        }
         return;
     }
     self.statusLabel.stringValue = @"Typing...";
@@ -972,19 +1037,33 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     BOOL trusted = isTrustedForTyping();
     NSAlert *a = [[NSAlert alloc] init];
     if (trusted) {
-        a.messageText = @"Accessibility Permission Granted";
-        a.informativeText = @"CardPass can type into password fields.";
+        a.messageText = @"Device Control Permission Granted ✓";
+        a.informativeText = @"CardPass can auto-type into password fields.\n\n"
+                             "Tip: Clipboard copy (⌘V) always works even without this permission.";
         [a addButtonWithTitle:@"OK"];
-    } else {
-        a.messageText = @"Accessibility Permission Needed";
-        a.informativeText = @"To auto-type card data into password fields, enable CardPass in:\n\nSystem Settings → Privacy & Security → Accessibility\n\nClick Open Settings to grant access.";
-        [a addButtonWithTitle:@"Open Settings"];
-        [a addButtonWithTitle:@"Cancel"];
-        NSModalResponse r = [a runModal];
-        if (r == NSAlertFirstButtonReturn) requestTypingPermission();
+        [a runModal];
         return;
     }
-    [a runModal];
+    a.messageText = @"Auto-Type Is Optional";
+    a.informativeText = @"CardPass always copies card hex to the clipboard — just press ⌘V to paste, no permission needed.\n\n"
+                         "Auto-type (automatic keystroke injection) is optional and requires:\n"
+                         "System Settings → Privacy & Security → Accessibility\n"
+                         "or on Tahoe: Privacy & Security → Device Control and Data Access\n\n"
+                         "Enable CardPass there, then *quit and reopen* CardPass for the change to take effect. "
+                         "If the toggle is already on and you still see this, try turning it off/on and restarting CardPass.";
+    [a addButtonWithTitle:@"Open Settings"];
+    [a addButtonWithTitle:@"Use Clipboard (No Permission Needed)"];
+    [a addButtonWithTitle:@"Cancel"];
+    NSModalResponse r = [a runModal];
+    if (r == NSAlertFirstButtonReturn) {
+        requestTypingPermission();
+    } else if (r == NSAlertSecondButtonReturn) {
+        // Disable auto-type so user stops seeing prompts — clipboard still works.
+        self.autoTypeCheck.state = NSControlStateValueOff;
+        [self toggleAutoType:self.autoTypeCheck];
+        self.statusLabel.stringValue = @"Auto-type disabled — clipboard copy still active ✓";
+        self.statusLabel.textColor = [NSColor systemGreenColor];
+    }
 }
 
 - (void)openBuyMeACoffee:(id)sender {

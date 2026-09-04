@@ -16,7 +16,7 @@
   2. Known AIDs (`A0 00 00 03 10 10` etc.) → `GET RESPONSE` / `READ BINARY`
   3. Telecom paths: `MF 3F00`, `EF ICCID 2FE2`, `EF IMSI 6F07`, `GET DATA`, `GET CHALLENGE`, NDEF — great for SIMs
   4. **ATR fallback** — guarantees stable hex even for YubiKeys/security keys that refuse all APDUs
-- **Clipboard + auto-type**: copies instantly; after 1s delay types into the frontmost field via `CGEvent` (requires Accessibility permission)
+- **Clipboard + auto-type**: copies instantly to clipboard (⌘V to paste — needs no permission); auto-type after 1 s via `CGEvent` is optional and needs Device Control / Accessibility
 - **UI**: Dock window (520×440) + menu-bar status item — both stay crash-free
 
 ---
@@ -28,7 +28,7 @@
 - macOS 10.13+ (tested on macOS 15–26, arm64)
 - Xcode Command Line Tools: `xcode-select --install`
 - A PC/SC reader plugged in (e.g., Identive SCR33xx). No extra drivers on macOS.
-- For auto-type: grant **System Settings → Privacy & Security → Accessibility → CardPass**
+- For auto-type (optional): grant **System Settings → Privacy & Security → Accessibility** (on Tahoe: **Device Control and Data Access**) → CardPass, then quit and reopen CardPass. Clipboard paste via ⌘V needs no permission.
 
 ### Quick build
 
@@ -67,12 +67,12 @@ The native app has **zero** pip dependencies. `requirements.txt` is only for the
 1. Open **CardPass** — window appears; menu-bar shows “Ready”.
 2. Insert any smart card / SIM / chip card.
 3. Wait for **“Card Read”** — hex appears in window and is copied.
-4. Click into any password field → after ~1s CardPass types the hex.
+4. Click into any password field → press **⌘V** to paste (clipboard is instant). If Auto-type is on and Device Control permission is granted, CardPass also auto-types after ~1 s.
 5. Window buttons: **Copy to Clipboard**, **Type into Field**, **Clear**, **Refresh**.
-6. Toggles: **Auto-copy** / **Auto-type** (both on by default). Uncheck Auto-type if you only want clipboard.
-7. Menu bar: **Show CardPass Window**, **Type**, **Auto-type ON/OFF**, **Readers detail**, **Check Accessibility**, **❤️ Buy Me a Coffee**, **Quit**.
+6. Toggles: **Auto-copy** / **Auto-type** (both on by default). Uncheck **Auto-type** if you only want clipboard — no permission needed.
+7. Menu bar: **Show CardPass Window**, **Type**, **Auto-type ON/OFF**, **Readers detail**, **Check Auto-Type Permission (Device Control)**…, **❤️ Buy Me a Coffee**, **Quit**.
 
-If auto-type does nothing, open **System Settings → Privacy & Security → Accessibility** and enable CardPass, then try **Check Accessibility Permission** in the menu.
+If auto-type does nothing, it’s expected: clipboard still works (⌘V). To enable auto-type, open **System Settings → Privacy & Security → Accessibility** (Tahoe: **Device Control and Data Access**) and enable CardPass, then **quit and reopen CardPass**. Use menu **Check Auto-Type Permission** to verify.
 
 ---
 
@@ -134,7 +134,7 @@ If CardPass saves you typing, consider buying the author a coffee: **https://buy
 
 - **No readers?** `system_profiler SPUSBDataType | grep -i -A2 card` and check Console → CardPass.
 - **No data?** Try another card/SIM; some cards need PIN or custom AID — please file an issue with ATR.
-- **Auto-type silent?** Grant Accessibility permission and retry **Check Accessibility Permission**.
+- **Auto-type silent?** This is now expected if Device Control is off — use **⌘V** to paste. To enable auto-type, grant **System Settings → Privacy & Security → Device Control and Data Access** (or Accessibility on older macOS) and **quit/reopen** CardPass. Check via menu **Check Auto-Type Permission**. If toggle is already on and it still shows not trusted, toggle off/on and reopen.
 - **Crash?** Should be fixed in 1.0 — if you still hit SIGSEGV, capture crash log and open an issue.
 
 ---

@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here. Follows Keep-a-Changelog and SemVer.
 
+## [1.0.1] — 2026-09-03
+
+### Fixed
+- **Permissions UI bug (Tahoe):** Menu bar no longer sticks on “Need Permission” and Check dialog no longer points to missing Accessibility pane. Tahoe moved the toggle to **Privacy & Security → Device Control and Data Access** (pre-Tahoe: Accessibility). CardPass now gracefully degrades: clipboard copy (⌘V) always works without permission; auto-type is optional and only attempts `CGEvent` when `AXIsProcessTrusted` is true.
+- **Auto-type nag:** Removed automatic modal on every card scan when not trusted. Now shows “Copied ✓ — press ⌘V to paste (enable Device Control for auto-type)” and returns to Ready after 2.5 s. Manual “Type” button explains the fallback and offers to copy again.
+- **Settings opener:** `requestTypingPermission()` now tries `openPrivacySettingsDirectly()` with Tahoe + pre-Tahoe URLs (`com.apple.settings.PrivacySecurity.extension?Privacy_DeviceControl` / `Privacy_Accessibility`) in addition to the standard `AXIsProcessTrustedWithOptions` prompt, so “Open Settings” lands in the right place on macOS 27 (Darwin 27.0.0, Build 26A5425a).
+- **UX copy:** Updated `Info.plist` `NSAppleEventsUsageDescription`, window hint, and menu titles (“Check Auto-Type Permission (Device Control)…”) to make it clear that Device Control is optional. Documented quit/reopen requirement when toggling.
+
+### Changed
+- `README.md` installation/usage/troubleshooting now notes Tahoe path and that clipboard needs no permission.
+
 ## [1.0.0] — 2026-09-03
 
 ### Added
