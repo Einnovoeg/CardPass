@@ -75,50 +75,81 @@ extern int pcsc_get_reader_has_card(void *list, int index);
 extern int pcsc_get_reader_atr_len(void *list, int index);
 
 static void copyToClipboard(const char *str) {
-    if (!str || str[0] == '\0') return;
-    dispatch_async(dispatch_get_main_queue(), ^{
+    if (!str || str[0] == '\0') {
+        NSLog(@"copyToClipboard: empty string, nothing to copy");
+        return;
+    }
+    NSString *s = [NSString stringWithUTF8String:str];
+    if (!s) {
+        NSLog(@"copyToClipboard: failed to create NSString from UTF8");
+        return;
+    }
+    // Must run on main thread; do synchronously if already there for immediate effect
+    void (^copyBlock)(void) = ^{
         NSPasteboard *pb = [NSPasteboard generalPasteboard];
         [pb clearContents];
-        NSString *s = [NSString stringWithUTF8String:str];
-        if (s) [pb setString:s forType:NSPasteboardTypeString];
-    });
+        // Declare type explicitly for robustness on Tahoe
+        [pb declareTypes:@[NSPasteboardTypeString] owner:nil];
+        BOOL ok = [pb setString:s forType:NSPasteboardTypeString];
+        NSLog(@"copyToClipboard: %@ (%lu chars) -> %@", ok?@"OK":@"FAIL", (unsigned long)s.length, s.length > 80 ? [[s substringToIndex:80] stringByAppendingString:@"…"] : s);
+        // Verify
+        NSString *verify = [pb stringForType:NSPasteboardTypeString];
+        if (![verify isEqualToString:s]) {
+            NSLog(@"copyToClipboard: VERIFY FAILED! Expected %@ got %@", s, verify);
+            // Try again without declareTypes
+            [pb clearContents];
+            [pb setString:s forType:NSPasteboardTypeString];
+        }
+    };
+    if ([NSThread isMainThread]) {
+        copyBlock();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), copyBlock);
+    }
 }
 
 static BOOL isTrustedForTyping(void) {
-    // On Tahoe (macOS 26/27) posting CGEvents requires Device Control,
-    // not just Accessibility. Check the modern PostEvent API first via runtime
-    // lookup so we compile on older SDKs. Fall back to AXIsProcessTrusted.
+    // Tahoe (27) moved the toggle to Device Control and Data Access, which is
+    // backed by CGPreflightPostEventAccess, while older macOS uses Accessibility
+    // (AXIsProcessTrusted). We check both via runtime lookup and consider trusted
+    // if *either* is granted — this handles betas where the UI says Device Control
+    // but the underlying TCC is still Accessibility, and vice versa.
+    BOOL postTrusted = NO;
+    BOOL axTrusted = NO;
+    BOOL hasPostAPI = NO;
+
     void *handle = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY);
     if (handle) {
-        // CGPreflightPostEventAccess is available on 10.15+ but the Device Control
-        // toggle on Tahoe maps to it. If it exists, trust requires it.
         BOOL (*preflight)(void) = (BOOL (*)(void))dlsym(handle, "CGPreflightPostEventAccess");
         if (preflight) {
-            BOOL postTrusted = preflight();
-            // Log AX as well for debugging, but don't double-close yet
-            NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @NO};
-            BOOL ax = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
-            dlclose(handle);
-            if (postTrusted) {
-                NSLog(@"isTrusted: PostEvent=%d AX=%d (Tahoe path)", postTrusted, ax);
-                return postTrusted;
-            } else {
-                NSLog(@"isTrusted: PostEvent=NO → not trusted (Device Control off) AX=%d", ax);
-                return NO;
-            }
+            hasPostAPI = YES;
+            postTrusted = preflight();
         }
         dlclose(handle);
     }
     NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @NO};
-    BOOL ax = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
-    NSLog(@"isTrusted: AX=%d (fallback path)", ax);
-    return ax;
+    axTrusted = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+
+    if (hasPostAPI) {
+        // On Tahoe either toggle may be the one the user enabled; accept either
+        BOOL trusted = postTrusted || axTrusted;
+        NSLog(@"isTrusted: PostEvent=%d AX=%d => %d (Tahoe combined)", postTrusted, axTrusted, trusted);
+        return trusted;
+    }
+    NSLog(@"isTrusted: AX=%d (fallback, no PostEvent API)", axTrusted);
+    return axTrusted;
+}
+
+static NSString *currentPrivacyPanePath(void) {
+    NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
+    if (v.majorVersion >= 26) {
+        return @"System Settings → Privacy & Security → Device Control and Data Access";
+    }
+    return @"System Settings → Privacy & Security → Accessibility";
 }
 
 static void openPrivacySettingsDirectly(void) {
-    // Try to open the correct Privacy pane directly. On Tahoe the toggle is
-    // Device Control and Data Access; on older it's Accessibility. Try several URLs;
-    // the system will ignore unknown ones.
+    // Tahoe uses Device Control, older uses Accessibility. Try Tahoe first.
     NSArray<NSString*> *candidates = @[
         @"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DeviceControl",
         @"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
@@ -747,10 +778,12 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     hexHint.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:hexHint];
 
-    NSScrollView *hexScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 118, 488, 112)];
-    hexScroll.hasVerticalScroller = YES;
+    // Password field is intentionally compact — wraps to content, not a large box.
+    // For 20 chars it shows a single line; for longer it wraps. Advanced pane holds large raw views.
+    NSScrollView *hexScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 118, 488, 44)];
+    hexScroll.hasVerticalScroller = NO; // single-line-ish, grows via text wrapping
     hexScroll.hasHorizontalScroller = NO;
-    hexScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    hexScroll.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     hexScroll.borderType = NSBezelBorder;
     hexScroll.drawsBackground = YES;
 
@@ -758,13 +791,19 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.hexTextView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, hexContentSize.width, hexContentSize.height)];
     self.hexTextView.editable = NO;
     self.hexTextView.selectable = YES;
-    self.hexTextView.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    self.hexTextView.font = [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightMedium];
     self.hexTextView.textColor = [NSColor labelColor];
     self.hexTextView.backgroundColor = [NSColor textBackgroundColor];
     self.hexTextView.string = @"No card data yet — insert a card to read";
     self.hexTextView.autoresizingMask = NSViewWidthSizable;
-    self.hexTextView.textContainerInset = NSMakeSize(6, 6);
+    self.hexTextView.textContainerInset = NSMakeSize(6, 8);
+    self.hexTextView.textContainer.lineFragmentPadding = 2;
     [self.hexTextView setAutomaticQuoteSubstitutionEnabled:NO];
+    // Make it wrap and be compact
+    self.hexTextView.textContainer.widthTracksTextView = YES;
+    self.hexTextView.maxSize = NSMakeSize(FLT_MAX, FLT_MAX);
+    self.hexTextView.horizontallyResizable = NO;
+    self.hexTextView.verticallyResizable = YES;
     hexScroll.documentView = self.hexTextView;
     [content addSubview:hexScroll];
 
@@ -910,7 +949,8 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     rawLabel.bezeled = NO; rawLabel.drawsBackground = NO; rawLabel.editable = NO; rawLabel.selectable = NO;
     [self.advancedPane addSubview:rawLabel];
 
-    NSScrollView *rawScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 300, 276, 100)];
+    // Larger raw boxes for advanced — show full card data, not just password
+    NSScrollView *rawScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 300, 276, 120)];
     rawScroll.hasVerticalScroller = YES;
     rawScroll.borderType = NSBezelBorder;
     rawScroll.drawsBackground = YES;
@@ -918,11 +958,11 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     NSSize rawSize = rawScroll.contentSize;
     self.rawHexView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, rawSize.width, rawSize.height)];
     self.rawHexView.editable = NO; self.rawHexView.selectable = YES;
-    self.rawHexView.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular];
+    self.rawHexView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
     self.rawHexView.textColor = [NSColor labelColor];
     self.rawHexView.backgroundColor = [NSColor textBackgroundColor];
     self.rawHexView.string = @"(raw data appears here after card read)";
-    self.rawHexView.textContainerInset = NSMakeSize(4,4);
+    self.rawHexView.textContainerInset = NSMakeSize(6,6);
     [self.rawHexView setAutomaticQuoteSubstitutionEnabled:NO];
     rawScroll.documentView = self.rawHexView;
     [self.advancedPane addSubview:rawScroll];
@@ -934,7 +974,7 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     preLabel.bezeled = NO; preLabel.drawsBackground = NO; preLabel.editable = NO; preLabel.selectable = NO;
     [self.advancedPane addSubview:preLabel];
 
-    NSScrollView *preScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 110, 276, 150)];
+    NSScrollView *preScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 110, 276, 155)];
     preScroll.hasVerticalScroller = YES;
     preScroll.borderType = NSBezelBorder;
     preScroll.drawsBackground = YES;
@@ -942,11 +982,11 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     NSSize preSize = preScroll.contentSize;
     self.preTruncateView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, preSize.width, preSize.height)];
     self.preTruncateView.editable = NO; self.preTruncateView.selectable = YES;
-    self.preTruncateView.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular];
+    self.preTruncateView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
     self.preTruncateView.textColor = [NSColor labelColor];
     self.preTruncateView.backgroundColor = [NSColor textBackgroundColor];
     self.preTruncateView.string = @"(encoded data before truncation)";
-    self.preTruncateView.textContainerInset = NSMakeSize(4,4);
+    self.preTruncateView.textContainerInset = NSMakeSize(6,6);
     [self.preTruncateView setAutomaticQuoteSubstitutionEnabled:NO];
     preScroll.documentView = self.preTruncateView;
     [self.advancedPane addSubview:preScroll];
@@ -993,12 +1033,20 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
         return;
     }
 
-    NSString *icnsPath = [[NSBundle mainBundle] pathForResource:@"AppIcon" ofType:@"icns"];
-    NSImage *icon = nil;
-    if (icnsPath) icon = [[NSImage alloc] initWithContentsOfFile:icnsPath];
+    // Menu bar icon: chip + stars, template for visibility on light/dark menu bars
+    NSImage *icon = [NSImage imageNamed:@"MenuIcon"];
+    if (!icon) {
+        NSString *menuPath = [[NSBundle mainBundle] pathForResource:@"MenuIcon" ofType:@"png"];
+        if (menuPath) icon = [[NSImage alloc] initWithContentsOfFile:menuPath];
+    }
+    if (!icon) {
+        // Fallback to AppIcon if MenuIcon not found (e.g. running via ./CardPass)
+        NSString *icnsPath = [[NSBundle mainBundle] pathForResource:@"AppIcon" ofType:@"icns"];
+        if (icnsPath) icon = [[NSImage alloc] initWithContentsOfFile:icnsPath];
+    }
     if (icon) {
-        icon.size = NSMakeSize(18, 18);
-        icon.template = NO;
+        icon.size = NSMakeSize(16, 16);
+        icon.template = YES; // monochrome, adapts to menu bar appearance
         self.statusButton.image = icon;
         self.statusButton.imagePosition = NSImageLeft;
         self.statusButton.title = @" CardPass";
@@ -1409,15 +1457,15 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 
 - (void)typeHex:(id)sender {
     if (self.lastHex.length == 0) { NSBeep(); return; }
-    // Auto-type requires Device Control / Accessibility. But clipboard paste
-    // via ⌘V always works without it, so we offer that as fallback.
+    // Auto-type requires Device Control (Tahoe) / Accessibility (pre-Tahoe). Clipboard always works.
     if (!isTrustedForTyping()) {
+        NSString *panePath = currentPrivacyPanePath();
         NSAlert *a = [[NSAlert alloc] init];
-        a.messageText = @"Auto-Type Needs Device Control Permission";
-        a.informativeText = @"CardPass can’t auto-type without permission, but clipboard copy always works.\n\n"
+        a.messageText = @"Auto-Type Needs Permission";
+        a.informativeText = [NSString stringWithFormat:@"CardPass can’t auto-type without permission, but clipboard copy always works.\n\n"
                              "• ✅ Clipboard: already copied — just press ⌘V to paste into any field.\n"
-                             "• For auto-type: open System Settings → Privacy & Security → Accessibility (or Device Control and Data Access on Tahoe) and enable CardPass, then restart CardPass.\n\n"
-                             "Tip: If the toggle is already on and this still appears, quit and reopen CardPass.";
+                             "• For auto-type: open %@ and enable CardPass, then quit and reopen CardPass.\n\n"
+                             "Tip: If the toggle is already on and this still appears, toggle it off/on, then quit and reopen CardPass.", panePath];
         [a addButtonWithTitle:@"Open Settings"];
         [a addButtonWithTitle:@"Copy Again"];
         [a addButtonWithTitle:@"Cancel"];
@@ -1765,13 +1813,13 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
         [a runModal];
         return;
     }
+    NSString *panePath = currentPrivacyPanePath();
     a.messageText = @"Auto-Type Is Optional";
-    a.informativeText = @"CardPass always copies card hex to the clipboard — just press ⌘V to paste, no permission needed.\n\n"
+    a.informativeText = [NSString stringWithFormat:@"CardPass always copies card data to the clipboard — just press ⌘V to paste, no permission needed.\n\n"
                          "Auto-type (automatic keystroke injection) is optional and requires:\n"
-                         "System Settings → Privacy & Security → Accessibility\n"
-                         "or on Tahoe: Privacy & Security → Device Control and Data Access\n\n"
+                         "%@\n\n"
                          "Enable CardPass there, then *quit and reopen* CardPass for the change to take effect. "
-                         "If the toggle is already on and you still see this, try turning it off/on and restarting CardPass.";
+                         "If the toggle is already on and you still see this, try turning it off/on and restarting CardPass.", panePath];
     [a addButtonWithTitle:@"Open Settings"];
     [a addButtonWithTitle:@"Use Clipboard (No Permission Needed)"];
     [a addButtonWithTitle:@"Cancel"];
