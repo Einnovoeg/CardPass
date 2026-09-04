@@ -411,7 +411,8 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 @property (assign, nonatomic) double autoTypeDelay;
 @property (strong, nonatomic) NSTextField *delayField;
 @property (strong, nonatomic) NSStepper *delayStepper;
-// Advanced pane (slide-out to the right)
+// Advanced pane — separate window that slides out to the right (per spec: not just expanding fields)
+@property (strong, nonatomic) NSWindow *advancedWindow;
 @property (strong, nonatomic) NSView *advancedPane;
 @property (strong, nonatomic) NSTextView *rawHexView;
 @property (strong, nonatomic) NSTextView *preTruncateView;
@@ -477,16 +478,20 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     [self setupWindow];
     [self setupStatusItem];
 
-    // If advanced was visible last run, expand window immediately
+    // If advanced was visible last run, show separate Advanced window
     if (_advancedVisible) {
-        NSRect f = self.mainWindow.frame;
-        f.size.width += 300;
-        f.origin.x -= 150;
-        [self.mainWindow setFrame:f display:NO];
-        self.advancedPane.hidden = NO;
-        // Update button title
+        NSRect mainFrame = self.mainWindow.frame;
+        NSRect advFrame = self.advancedWindow.frame;
+        advFrame.origin.x = NSMaxX(mainFrame) + 8;
+        advFrame.origin.y = mainFrame.origin.y + (mainFrame.size.height - advFrame.size.height)/2;
+        [self.advancedWindow setFrame:advFrame display:NO];
+        [self.advancedWindow orderFront:nil];
+        [self.mainWindow addChildWindow:self.advancedWindow ordered:NSWindowAbove];
         NSButton *btn = (NSButton *)[self.mainWindow.contentView viewWithTag:999];
         if (btn) btn.title = @"◀ Advanced";
+        self.advancedPane.hidden = NO;
+    } else {
+        self.advancedPane.hidden = YES;
     }
 
     _pollTimer = [NSTimer scheduledTimerWithTimeInterval:1.5 target:self selector:@selector(pollReaders) userInfo:nil repeats:YES];
@@ -778,10 +783,10 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     hexHint.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:hexHint];
 
-    // Password field is intentionally compact — wraps to content, not a large box.
+    // Password field is intentionally compact and directly under the label — wraps to content.
     // For 20 chars it shows a single line; for longer it wraps. Advanced pane holds large raw views.
-    NSScrollView *hexScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 118, 488, 44)];
-    hexScroll.hasVerticalScroller = NO; // single-line-ish, grows via text wrapping
+    NSScrollView *hexScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 195, 488, 44)];
+    hexScroll.hasVerticalScroller = NO;
     hexScroll.hasHorizontalScroller = NO;
     hexScroll.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     hexScroll.borderType = NSBezelBorder;
@@ -923,34 +928,41 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     }
     [content addSubview:coffeeLink];
 
-    // Advanced pane (hidden by default, slides out to the right)
-    self.advancedPane = [[NSView alloc] initWithFrame:NSMakeRect(520, 0, 300, 470)];
-    self.advancedPane.wantsLayer = YES;
-    self.advancedPane.layer.backgroundColor = [[NSColor colorWithWhite:0.11 alpha:1.0] CGColor];
-    self.advancedPane.autoresizingMask = NSViewMinXMargin | NSViewHeightSizable;
-    self.advancedPane.hidden = !self.advancedVisible;
+    // Advanced pane — separate window that slides out to the right, per spec.
+    // Main password field (left window) stays compact and unchanged; this pane shows two
+    // separate, larger boxes: Raw Hex and Encoded pre-truncate.
+    NSRect advFrame = NSMakeRect(0, 0, 360, 470);
+    self.advancedWindow = [[NSWindow alloc] initWithContentRect:advFrame
+                                                      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+                                                        backing:NSBackingStoreBuffered defer:NO];
+    self.advancedWindow.title = @"CardPass — Advanced";
+    self.advancedWindow.minSize = NSMakeSize(340, 400);
+    self.advancedWindow.releasedWhenClosed = NO;
+    self.advancedWindow.delegate = self;
+    self.advancedWindow.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    self.advancedWindow.backgroundColor = [NSColor colorWithWhite:0.13 alpha:1.0];
+    self.advancedWindow.isVisible = NO; // shown via toggleAdvancedPane:
+    // Position it to the right of main window on first show
+    NSView *advContent = self.advancedWindow.contentView;
+    advContent.wantsLayer = YES;
+    advContent.layer.backgroundColor = [[NSColor colorWithWhite:0.11 alpha:1.0] CGColor];
 
-    NSBox *advSep = [[NSBox alloc] initWithFrame:NSMakeRect(0, 0, 1, 470)];
-    advSep.boxType = NSBoxSeparator;
-    advSep.autoresizingMask = NSViewHeightSizable | NSViewMinXMargin;
-    [self.advancedPane addSubview:advSep];
-
-    NSTextField *advTitle = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 440, 276, 16)];
+    NSTextField *advTitle = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 440, 336, 16)];
     advTitle.stringValue = @"Advanced — Raw & Pre-Truncate";
     advTitle.font = [NSFont boldSystemFontOfSize:12];
     advTitle.textColor = [NSColor labelColor];
     advTitle.bezeled = NO; advTitle.drawsBackground = NO; advTitle.editable = NO; advTitle.selectable = NO;
-    [self.advancedPane addSubview:advTitle];
+    [advContent addSubview:advTitle];
 
-    NSTextField *rawLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 418, 276, 12)];
+    NSTextField *rawLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 418, 336, 12)];
     rawLabel.stringValue = @"Raw Hex (non-encoded, non-hashed, non-truncated):";
     rawLabel.font = [NSFont systemFontOfSize:10 weight:NSFontWeightSemibold];
     rawLabel.textColor = [NSColor secondaryLabelColor];
     rawLabel.bezeled = NO; rawLabel.drawsBackground = NO; rawLabel.editable = NO; rawLabel.selectable = NO;
-    [self.advancedPane addSubview:rawLabel];
+    [advContent addSubview:rawLabel];
 
-    // Larger raw boxes for advanced — show full card data, not just password
-    NSScrollView *rawScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 300, 276, 120)];
+    // Larger raw boxes — show full card data
+    NSScrollView *rawScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 300, 336, 110)];
     rawScroll.hasVerticalScroller = YES;
     rawScroll.borderType = NSBezelBorder;
     rawScroll.drawsBackground = YES;
@@ -965,16 +977,16 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.rawHexView.textContainerInset = NSMakeSize(6,6);
     [self.rawHexView setAutomaticQuoteSubstitutionEnabled:NO];
     rawScroll.documentView = self.rawHexView;
-    [self.advancedPane addSubview:rawScroll];
+    [advContent addSubview:rawScroll];
 
-    NSTextField *preLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 280, 276, 12)];
+    NSTextField *preLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 280, 336, 12)];
     preLabel.stringValue = @"Encoded + Hashed (pre-truncate):";
     preLabel.font = [NSFont systemFontOfSize:10 weight:NSFontWeightSemibold];
     preLabel.textColor = [NSColor secondaryLabelColor];
     preLabel.bezeled = NO; preLabel.drawsBackground = NO; preLabel.editable = NO; preLabel.selectable = NO;
-    [self.advancedPane addSubview:preLabel];
+    [advContent addSubview:preLabel];
 
-    NSScrollView *preScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 110, 276, 155)];
+    NSScrollView *preScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 110, 336, 155)];
     preScroll.hasVerticalScroller = YES;
     preScroll.borderType = NSBezelBorder;
     preScroll.drawsBackground = YES;
@@ -989,35 +1001,38 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
     self.preTruncateView.textContainerInset = NSMakeSize(6,6);
     [self.preTruncateView setAutomaticQuoteSubstitutionEnabled:NO];
     preScroll.documentView = self.preTruncateView;
-    [self.advancedPane addSubview:preScroll];
+    [advContent addSubview:preScroll];
 
-    NSButton *copyRawBtn = [[NSButton alloc] initWithFrame:NSMakeRect(12, 108, 120, 22)];
+    NSButton *copyRawBtn = [[NSButton alloc] initWithFrame:NSMakeRect(12, 78, 150, 22)];
     copyRawBtn.title = @"Copy Raw Hex";
     copyRawBtn.bezelStyle = NSBezelStyleRounded;
     copyRawBtn.font = [NSFont systemFontOfSize:11];
     copyRawBtn.target = self;
     copyRawBtn.action = @selector(copyRawHex:);
-    [self.advancedPane addSubview:copyRawBtn];
+    [advContent addSubview:copyRawBtn];
 
-    NSButton *copyPreBtn = [[NSButton alloc] initWithFrame:NSMakeRect(140, 108, 148, 22)];
+    NSButton *copyPreBtn = [[NSButton alloc] initWithFrame:NSMakeRect(170, 78, 178, 22)];
     copyPreBtn.title = @"Copy Encoded";
     copyPreBtn.bezelStyle = NSBezelStyleRounded;
     copyPreBtn.font = [NSFont systemFontOfSize:11];
     copyPreBtn.target = self;
     copyPreBtn.action = @selector(copyPreTruncate:);
-    [self.advancedPane addSubview:copyPreBtn];
+    [advContent addSubview:copyPreBtn];
 
-    NSTextField *advHint = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 12, 276, 90)];
-    advHint.stringValue = @"Raw Hex is the exact bytes from the card (hex). Encoded shows the result after Base62/58/64 + SHA-256 but before truncation — useful to verify what was shortened. Main password field (left) is the final truncated output.";
+    NSTextField *advHint = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 12, 336, 60)];
+    advHint.stringValue = @"Raw Hex is the exact bytes from the card (hex). Encoded shows the result after Base62/58/64 + SHA-256 but before truncation. Main password field (left window) is the final truncated output and is intentionally compact.";
     advHint.font = [NSFont systemFontOfSize:10];
     advHint.textColor = [NSColor secondaryLabelColor];
     advHint.bezeled = NO; advHint.drawsBackground = NO; advHint.editable = NO; advHint.selectable = NO;
     advHint.usesSingleLineMode = NO;
-    [advHint setPreferredMaxLayoutWidth:276];
+    [advHint setPreferredMaxLayoutWidth:336];
     advHint.autoresizingMask = NSViewWidthSizable;
-    [self.advancedPane addSubview:advHint];
+    [advContent addSubview:advHint];
 
-    [content addSubview:self.advancedPane];
+    // Keep a hidden pane view for backwards-compat (not used for layout, but keeps property non-nil)
+    self.advancedPane = [[NSView alloc] initWithFrame:NSMakeRect(0,0,0,0)];
+    self.advancedPane.hidden = YES;
+    [self.advancedPane setHidden:YES];
 
     NSBox *bottomSep = [[NSBox alloc] initWithFrame:NSMakeRect(0, 70, 520, 1)];
     bottomSep.boxType = NSBoxSeparator;
@@ -1584,39 +1599,35 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 - (void)toggleAdvancedPane:(id)sender {
     self.advancedVisible = !self.advancedVisible;
     [[NSUserDefaults standardUserDefaults] setBool:self.advancedVisible forKey:@"CPAdvancedVisible"];
-    // Find the Advanced button by tag 999 (set in setupWindow)
+    // Update button title in main window
     NSView *content = self.mainWindow.contentView;
     NSButton *advBtn = (NSButton *)[content viewWithTag:999];
     if (!advBtn) {
-        // search deeper
         for (NSView *sv in content.subviews) {
             advBtn = (NSButton *)[sv viewWithTag:999];
             if (advBtn) break;
         }
     }
     if (advBtn) advBtn.title = self.advancedVisible ? @"◀ Advanced" : @"Advanced ▶";
-    // Animate window resize
-    NSRect frame = self.mainWindow.frame;
-    CGFloat delta = 300;
+
     if (self.advancedVisible) {
-        frame.size.width += delta;
-        frame.origin.x -= delta/2; // keep centered
-        self.advancedPane.hidden = NO;
-    } else {
-        frame.size.width -= delta;
-        frame.origin.x += delta/2;
-    }
-    [self.mainWindow setFrame:frame display:YES animate:YES];
-    if (!self.advancedVisible) {
-        // Hide after animation
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            self.advancedPane.hidden = YES;
-        });
-    } else {
-        // Update raw views
+        // Show separate Advanced window to the right of main window
+        NSRect mainFrame = self.mainWindow.frame;
+        NSRect advFrame = self.advancedWindow.frame;
+        advFrame.origin.x = NSMaxX(mainFrame) + 8;
+        advFrame.origin.y = mainFrame.origin.y + (mainFrame.size.height - advFrame.size.height)/2;
+        [self.advancedWindow setFrame:advFrame display:NO];
+        [self.advancedWindow makeKeyAndOrderFront:sender];
+        [self.mainWindow addChildWindow:self.advancedWindow ordered:NSWindowAbove];
         [self updateTransformedDisplay];
+        NSLog(@"Advanced window shown at %.0f,%.0f", advFrame.origin.x, advFrame.origin.y);
+    } else {
+        [self.mainWindow removeChildWindow:self.advancedWindow];
+        [self.advancedWindow orderOut:sender];
+        NSLog(@"Advanced window hidden");
     }
-    NSLog(@"Advanced pane %@", self.advancedVisible?@"shown":@"hidden");
+    // Also keep hidden flag for backwards compat
+    self.advancedPane.hidden = !self.advancedVisible;
 }
 
 - (void)copyRawHex:(id)sender {
@@ -1840,8 +1851,29 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NS
 }
 
 - (BOOL)windowShouldClose:(NSWindow *)sender {
+    if (sender == self.advancedWindow) {
+        // User closed Advanced window via red button — toggle state
+        self.advancedVisible = NO;
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"CPAdvancedVisible"];
+        NSButton *btn = (NSButton *)[self.mainWindow.contentView viewWithTag:999];
+        if (btn) btn.title = @"Advanced ▶";
+        [self.mainWindow removeChildWindow:self.advancedWindow];
+        [sender orderOut:nil];
+        return NO;
+    }
     [sender orderOut:nil];
     return NO;
+}
+
+- (void)windowDidMove:(NSNotification *)notification {
+    // Keep Advanced window glued to the right of main window
+    if (notification.object == self.mainWindow && self.advancedVisible && self.advancedWindow.isVisible) {
+        NSRect mainFrame = self.mainWindow.frame;
+        NSRect advFrame = self.advancedWindow.frame;
+        advFrame.origin.x = NSMaxX(mainFrame) + 8;
+        advFrame.origin.y = mainFrame.origin.y + (mainFrame.size.height - advFrame.size.height)/2;
+        [self.advancedWindow setFrame:advFrame display:YES];
+    }
 }
 
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {
