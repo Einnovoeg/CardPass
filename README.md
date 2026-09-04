@@ -17,7 +17,8 @@
   3. Telecom paths: `MF 3F00`, `EF ICCID 2FE2`, `EF IMSI 6F07`, `GET DATA`, `GET CHALLENGE`, NDEF — great for SIMs
   4. **ATR fallback** — guarantees stable hex even for YubiKeys/security keys that refuse all APDUs
 - **Clipboard + auto-type**: copies instantly to clipboard (⌘V to paste — needs no permission); auto-type after 1 s via `CGEvent` is optional and needs Device Control / Accessibility
-- **UI**: Dock window (520×440) + menu-bar status item — both stay crash-free
+- **Smart encoding**: choose **Hex (Base16)**, **Base62** (alphanumeric, ~30% shorter, never rejected), **Base58** (no ambiguous 0/O/I/l, for humans), **Base64** (+/ with padding); optionally **Hash with SHA-256** (32 bytes → always 43 Base62 chars, truncatable to 16-24) and **Truncate** to any length — so hex’s 2-chars-per-byte is eliminated
+- **UI**: Dock window (520×500) + menu-bar status item — both stay crash-free
 
 ---
 
@@ -67,10 +68,11 @@ The native app has **zero** pip dependencies. `requirements.txt` is only for the
 1. Open **CardPass** — window appears; menu-bar shows “Ready”.
 2. Insert any smart card / SIM / chip card.
 3. Wait for **“Card Read”** — hex appears in window and is copied.
-4. Click into any password field → press **⌘V** to paste (clipboard is instant). If Auto-type is on and Device Control permission is granted, CardPass also auto-types after ~1 s.
-5. Window buttons: **Copy to Clipboard**, **Type into Field**, **Clear**, **Refresh**.
-6. Toggles: **Auto-copy** / **Auto-type** (both on by default). Uncheck **Auto-type** if you only want clipboard — no permission needed.
-7. Menu bar: **Show CardPass Window**, **Type**, **Auto-type ON/OFF**, **Readers detail**, **Check Auto-Type Permission (Device Control)**…, **❤️ Buy Me a Coffee**, **Quit**.
+4. Choose output encoding in the window: **Output:** `Hex` → `Base62` (recommended for passwords, alphanumeric only), `Base58` (human-friendly), `Base64` — then optionally tick **Hash SHA-256** (condenses any card to 32 bytes → 43 Base62 chars, ideal for huge data) and set **Truncate** (e.g. 24 or 16) to fit strict password length limits.
+5. Click into any password field → press **⌘V** to paste (clipboard is instant). If Auto-type is on and Device Control permission is granted, CardPass also auto-types after ~1 s.
+6. Window buttons: **Copy to Clipboard**, **Type into Field**, **Clear**, **Refresh** — all respect the chosen encoding/hash/truncate.
+7. Toggles: **Auto-copy** / **Auto-type** (both on by default). Uncheck **Auto-type** if you only want clipboard — no permission needed.
+8. Menu bar: **Show CardPass Window**, **Type**, **Auto-type ON/OFF**, **Readers detail**, **Check Auto-Type Permission (Device Control)**…, **❤️ Buy Me a Coffee**, **Quit**.
 
 If auto-type does nothing, it’s expected: clipboard still works (⌘V). To enable auto-type, open **System Settings → Privacy & Security → Accessibility** (Tahoe: **Device Control and Data Access**) and enable CardPass, then **quit and reopen CardPass**. Use menu **Check Auto-Type Permission** to verify.
 
@@ -80,7 +82,7 @@ If auto-type does nothing, it’s expected: clipboard still works (⌘V). To ena
 
 ```
 CardPass.app (Cocoa, ARC)
- ├─ main.m — AppDelegate, NSWindow + NSStatusItem, GCD polling, clipboard/CGEvent
+ ├─ main.m — AppDelegate, NSWindow (520×500) + NSStatusItem, GCD polling, clipboard/CGEvent, Base62/58/64 + SHA-256 + truncate pipeline
  └─ pcsc_reader.h/c — PC/SC wrapper (thread-safe, system PCSC.framework only)
 deprecated/ — legacy Python (rumps/pyscard) kept locally, not shipped
 Resources/ — AppIcon.icns, icon.png
@@ -99,6 +101,12 @@ Polling: 1.5 s timer → `pcsc_list_readers()` on background queue → ATR-chang
 
 ---
 
+## Password Encoding Tips
+
+- **If your hex is 32-64 chars** (e.g. 16-32 bytes): use **Base62** — alphanumeric only, ~30% shorter than hex, never rejected.
+- **If hex is hundreds of chars** and you don’t need to decode: tick **Hash SHA-256 → Base62** → always 43 chars; then **Truncate** to 16-24 for strict fields. Hash is uniformly distributed, so truncation is cryptographically safe.
+- **If humans must read/type:** use **Base58** (no 0/O/I/l).
+
 ## Known Issues & Help Wanted
 
 CardPass 1.0 is stable on the tested readers, but smart-card ecosystems are huge. Please help fix what you find!
@@ -106,7 +114,8 @@ CardPass 1.0 is stable on the tested readers, but smart-card ecosystems are huge
 - **YubiKey / FIDO keys** always report “present” — CardPass now returns their ATR hex (stable per key) rather than error. If your flow needs *no* data for security keys, open an issue.
 - **MIFARE Classic with custom keys** — UID reads via `FF CA`, but sector auth (`FF 86`) is not attempted. PRs to add key-file auth are welcome.
 - **SIM PIN-locked cards** — `pcsc_read_card` does not send `VERIFY PIN`. Reading ICCID/IMSI may require PIN; we should surface a PIN prompt.
-- **Long hex** (>512 bytes) is truncated to 1024 hex chars by design; file-backed reads could stream instead.
+- **Long hex** (>512 bytes) is truncated to 1024 hex chars by design (before encoding); file-backed reads could stream instead. Hash+truncate already mitigates this for passwords.
+- **Encoding edge:** Base62/Base58 preserve leading zero bytes as `0`/`1`; please report if your reader’s data has unusual leading zeros.
 - **Window reopen** via Dock click uses `applicationShouldHandleReopen`; if hidden, use menu **Show CardPass Window**. Spotlight re-activation edge cases need testing.
 - **AppleScript quit** — standard `terminate:` via menus works; `osascript -e 'tell application "CardPass" to quit'` is not scriptable beyond NSApplication defaults — use menu/⌘Q.
 - **Reader hot-plug** on sleep/wake is not yet fully tested; please report.

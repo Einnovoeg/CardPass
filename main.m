@@ -46,6 +46,7 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <CommonCrypto/CommonDigest.h>
 
 typedef struct {
     int success;
@@ -159,11 +160,148 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     return s;
 }
 
+// MARK: - Encoding & Hashing Helpers (for password generation)
+// Hex (Base16) is wasteful (2 chars per byte, only 0-9A-F). We offer:
+//   Base62: 0-9A-Za-z (alphanumeric, never rejected by strict fields), ~30% shorter than hex
+//   Base58: Bitcoin alphabet (no 0/O/I/l — ideal for human transcription)
+//   Base64: 0-9A-Za-z+/ with = padding, ~33% shorter than hex (may include +/)
+// Hash: SHA-256 condenses any length to 32 bytes, then Base62 → 43 chars, truncatable to 16-24
+
+typedef NS_ENUM(NSInteger, CPEncoding) {
+    CPEncodingHex = 0,   // Base16 uppercase
+    CPEncodingBase62 = 1,
+    CPEncodingBase58 = 2,
+    CPEncodingBase64 = 3,
+};
+
+static NSString *alphabetBase62(void) { return @"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"; }
+static NSString *alphabetBase58(void) { return @"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"; }
+
+/** Convert hex string (e.g. "0A1B") to NSData. Ignores whitespace. Returns nil on invalid hex. */
+static NSData *dataFromHexString(NSString *hex) {
+    if (!hex) return nil;
+    // Remove whitespace/newlines
+    NSString *clean = [[hex componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] componentsJoinedByString:@""];
+    if (clean.length == 0) return [NSData data];
+    if (clean.length % 2 != 0) return nil; // must be even
+    NSMutableData *data = [NSMutableData dataWithCapacity:clean.length/2];
+    for (NSUInteger i = 0; i < clean.length; i += 2) {
+        NSString *byteStr = [clean substringWithRange:NSMakeRange(i, 2)];
+        unsigned int byteVal = 0;
+        NSScanner *sc = [NSScanner scannerWithString:byteStr];
+        if (![sc scanHexInt:&byteVal]) return nil;
+        uint8_t b = (uint8_t)byteVal;
+        [data appendBytes:&b length:1];
+    }
+    return data;
+}
+
+/** Generic base-N encode for Base62/Base58 using big-integer division.
+ *  Correctly preserves leading zero bytes (they become '0' for B62, '1' for B58).
+ */
+static NSString *baseEncodeData(NSData *data, NSString *alphabet) {
+    if (!data || data.length == 0) return @"";
+    NSUInteger base = alphabet.length;
+    // Count leading zero bytes
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+    NSUInteger leadingZeros = 0;
+    while (leadingZeros < data.length && bytes[leadingZeros] == 0) leadingZeros++;
+
+    // Convert the non-zero part via repeated division
+    NSMutableData *mutable = [NSMutableData dataWithCapacity:data.length];
+    // Copy non-zero suffix
+    if (leadingZeros < data.length) {
+        [mutable appendBytes:bytes+leadingZeros length:data.length-leadingZeros];
+    } else {
+        // All zeros -> return leading zeros encoded
+        NSMutableString *r = [NSMutableString string];
+        for (NSUInteger i=0;i<leadingZeros;i++) [r appendFormat:@"%C", [alphabet characterAtIndex:0]];
+        return r;
+    }
+
+    NSMutableString *result = [NSMutableString string];
+    // Work on mutable copy of bytes as big-endian integer
+    NSMutableData *num = [mutable mutableCopy];
+    while (num.length > 0) {
+        uint32_t remainder = 0;
+        NSMutableData *quotient = [NSMutableData data];
+        const uint8_t *qBytes = (const uint8_t *)num.bytes;
+        BOOL leading = YES;
+        for (NSUInteger i = 0; i < num.length; i++) {
+            uint32_t cur = remainder * 256 + qBytes[i];
+            uint8_t q = cur / (uint32_t)base;
+            remainder = cur % (uint32_t)base;
+            if (!leading || q != 0) {
+                [quotient appendBytes:&q length:1];
+                leading = NO;
+            } else if (quotient.length > 0) {
+                // Already started
+                [quotient appendBytes:&q length:1];
+            }
+        }
+        [result insertString:[NSString stringWithFormat:@"%C", [alphabet characterAtIndex:remainder]] atIndex:0];
+        // Check if quotient is all zero
+        BOOL allZero = YES;
+        const uint8_t *qb = (const uint8_t *)quotient.bytes;
+        for (NSUInteger i=0;i<quotient.length;i++) if (qb[i]!=0) { allZero = NO; break; }
+        if (allZero || quotient.length==0) break;
+        num = quotient;
+        // Avoid infinite loop on tiny data
+        if (result.length > 2048) break;
+    }
+    // Prepend leading-zero characters
+    for (NSUInteger i=0;i<leadingZeros;i++) [result insertString:[NSString stringWithFormat:@"%C", [alphabet characterAtIndex:0]] atIndex:0];
+    return result;
+}
+
+static NSString *base62EncodeData(NSData *data) { return baseEncodeData(data, alphabetBase62()); }
+static NSString *base58EncodeData(NSData *data) { return baseEncodeData(data, alphabetBase58()); }
+static NSString *base64EncodeData(NSData *data) { return [data base64EncodedStringWithOptions:0]; }
+
+static NSData *sha256Data(NSData *data) {
+    if (!data) return nil;
+    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, hash);
+    return [NSData dataWithBytes:hash length:CC_SHA256_DIGEST_LENGTH];
+}
+
+/** Core transform: raw bytes -> (hash? SHA256 : raw) -> encode -> truncate.
+ *  - encoding: Hex/Base62/Base58/Base64
+ *  - hash: if YES, SHA256 first (32 bytes -> e.g. Base62 43 chars)
+ *  - truncate: 0 = no truncation, else limit to N characters (clipped if shorter)
+ */
+static NSString *transformData(NSData *raw, CPEncoding encoding, BOOL doHash, NSInteger truncate) {
+    if (!raw) return @"";
+    NSData *src = raw;
+    if (doHash) {
+        src = sha256Data(raw);
+        if (!src) return @"";
+    }
+    NSString *encoded = @"";
+    switch (encoding) {
+        case CPEncodingBase62: encoded = base62EncodeData(src); break;
+        case CPEncodingBase58: encoded = base58EncodeData(src); break;
+        case CPEncodingBase64: encoded = base64EncodeData(src); break;
+        case CPEncodingHex:
+        default: {
+            NSMutableString *hex = [NSMutableString stringWithCapacity:src.length*2];
+            const uint8_t *b = src.bytes;
+            for (NSUInteger i=0;i<src.length;i++) [hex appendFormat:@"%02X", b[i]];
+            encoded = hex;
+            break;
+        }
+    }
+    if (truncate > 0 && encoded.length > truncate) {
+        return [encoded substringToIndex:truncate];
+    }
+    return encoded;
+}
+
 /**
  * AppDelegate — owns window, status item, polling, and card I/O orchestration.
  * All PC/SC work is off the main thread; UI updates are main-thread only.
  */
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate, NSControlTextEditingDelegate>
 @property (strong, nonatomic) NSStatusItem *statusItem;
 @property (strong, nonatomic) NSStatusBarButton *statusButton;
 @property (strong, nonatomic) NSMenu *statusMenu;
@@ -191,6 +329,17 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
 @property (strong, nonatomic) NSTimer *pollTimer;
 @property (assign, nonatomic) int knownReaderCount;
 
+// Raw bytes + transformed password handling
+@property (strong, nonatomic) NSData *lastRawData;
+@property (assign, nonatomic) CPEncoding selectedEncoding;
+@property (assign, nonatomic) BOOL hashEnabled;
+@property (assign, nonatomic) NSInteger truncateLength;
+@property (strong, nonatomic) NSPopUpButton *encodingPopup;
+@property (strong, nonatomic) NSButton *hashCheck;
+@property (strong, nonatomic) NSTextField *truncateField;
+@property (strong, nonatomic) NSStepper *truncateStepper;
+@property (strong, nonatomic) NSTextField *encodingInfoLabel;
+
 - (void)setupMainMenu;
 - (void)setupStatusItem;
 - (void)setupWindow;
@@ -208,6 +357,11 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
 - (void)refreshReaders:(id)sender;
 - (void)checkAccessibility:(id)sender;
 - (void)openBuyMeACoffee:(id)sender;
+- (void)encodingChanged:(id)sender;
+- (void)hashToggled:(id)sender;
+- (void)truncateChanged:(id)sender;
+- (void)updateTransformedDisplay;
+- (NSString *)currentTransformedString;
 @end
 
 @implementation AppDelegate
@@ -218,6 +372,18 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     _lastAtrByReader = [NSMutableDictionary dictionary];
     _isReading = NO;
     _knownReaderCount = 0;
+    _lastRawData = nil;
+    _selectedEncoding = CPEncodingHex;
+    _hashEnabled = NO;
+    _truncateLength = 0; // 0 = no truncation
+    // Restore user prefs if any
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSInteger savedEnc = [defaults integerForKey:@"CPEncoding"];
+    if (savedEnc >= 0 && savedEnc <= 3) _selectedEncoding = (CPEncoding)savedEnc;
+    _hashEnabled = [defaults boolForKey:@"CPHashEnabled"];
+    _truncateLength = [defaults integerForKey:@"CPTruncateLength"];
+    if (_truncateLength < 0) _truncateLength = 0;
+    if (_truncateLength > 128) _truncateLength = 128;
 
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp activateIgnoringOtherApps:YES];
@@ -307,14 +473,15 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
 }
 
 - (void)setupWindow {
-    NSRect frame = NSMakeRect(0, 0, 520, 440);
+    // Window is 520×500 to fit encoding controls (hex/Base62 + hash/truncate row)
+    NSRect frame = NSMakeRect(0, 0, 520, 500);
     NSWindow *w = [[NSWindow alloc] initWithContentRect:frame
                                               styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                                 backing:NSBackingStoreBuffered defer:NO];
     w.title = @"CardPass";
     w.delegate = self;
     w.releasedWhenClosed = NO;
-    w.minSize = NSMakeSize(500, 400);
+    w.minSize = NSMakeSize(520, 480);
     [w center];
     w.backgroundColor = [NSColor windowBackgroundColor];
     w.titlebarAppearsTransparent = NO;
@@ -323,7 +490,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
 
     NSView *content = w.contentView;
 
-    NSView *header = [[NSView alloc] initWithFrame:NSMakeRect(0, 380, 520, 60)];
+    NSView *header = [[NSView alloc] initWithFrame:NSMakeRect(0, 440, 520, 60)];
     header.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     header.wantsLayer = YES;
 
@@ -357,7 +524,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     [header addSubview:sep];
     [content addSubview:header];
 
-    NSTextField *statusTitle = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 350, 60, 16)];
+    NSTextField *statusTitle = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 410, 60, 16)];
     statusTitle.stringValue = @"Status:";
     statusTitle.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
     statusTitle.textColor = [NSColor secondaryLabelColor];
@@ -365,7 +532,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     statusTitle.autoresizingMask = NSViewMaxYMargin | NSViewMinXMargin;
     [content addSubview:statusTitle];
 
-    self.statusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(70, 348, 360, 20)];
+    self.statusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(70, 408, 360, 20)];
     self.statusLabel.stringValue = @"Initializing...";
     self.statusLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
     self.statusLabel.textColor = [NSColor labelColor];
@@ -373,7 +540,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     self.statusLabel.autoresizingMask = NSViewMaxYMargin | NSViewWidthSizable;
     [content addSubview:self.statusLabel];
 
-    self.spinner = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(460, 348, 16, 16)];
+    self.spinner = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(460, 408, 16, 16)];
     self.spinner.style = NSProgressIndicatorStyleSpinning;
     self.spinner.controlSize = NSControlSizeSmall;
     self.spinner.displayedWhenStopped = NO;
@@ -381,7 +548,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     self.spinner.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [content addSubview:self.spinner];
 
-    NSTextField *readersLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 328, 100, 14)];
+    NSTextField *readersLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 388, 100, 14)];
     readersLabel.stringValue = @"Readers";
     readersLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
     readersLabel.textColor = [NSColor labelColor];
@@ -389,7 +556,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     readersLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:readersLabel];
 
-    self.readerCountLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(70, 328, 120, 14)];
+    self.readerCountLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(70, 388, 120, 14)];
     self.readerCountLabel.stringValue = @"(scanning...)";
     self.readerCountLabel.font = [NSFont systemFontOfSize:10];
     self.readerCountLabel.textColor = [NSColor secondaryLabelColor];
@@ -397,7 +564,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     self.readerCountLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.readerCountLabel];
 
-    NSScrollView *readersScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 246, 488, 78)];
+    NSScrollView *readersScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 306, 488, 78)];
     readersScroll.hasVerticalScroller = YES;
     readersScroll.hasHorizontalScroller = NO;
     readersScroll.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
@@ -416,15 +583,84 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     readersScroll.documentView = self.readersTextView;
     [content addSubview:readersScroll];
 
-    NSTextField *hexLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 224, 200, 14)];
-    hexLabel.stringValue = @"Card Data (hex)";
+    // --- Encoding controls bar (new) ---
+    // Encoding popup: Hex / Base62 (recommended) / Base58 / Base64
+    // Plus hash checkbox and truncate length
+    NSTextField *encLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 282, 50, 14)];
+    encLabel.stringValue = @"Output:";
+    encLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+    encLabel.textColor = [NSColor labelColor];
+    encLabel.bezeled = NO; encLabel.drawsBackground = NO; encLabel.editable = NO; encLabel.selectable = NO;
+    encLabel.autoresizingMask = NSViewMaxYMargin;
+    [content addSubview:encLabel];
+
+    self.encodingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(70, 277, 140, 24) pullsDown:NO];
+    [self.encodingPopup addItemsWithTitles:@[@"Hex (Base16)", @"Base62 (A-Za-z0-9)", @"Base58 (no 0/O/I/l)", @"Base64 (+/ with =)"]];
+    [self.encodingPopup selectItemAtIndex:self.selectedEncoding];
+    self.encodingPopup.target = self;
+    self.encodingPopup.action = @selector(encodingChanged:);
+    self.encodingPopup.toolTip = @"Base62 recommended: alphanumeric only, ~30% shorter than hex. Base58 ideal for human transcription.";
+    self.encodingPopup.autoresizingMask = NSViewMaxYMargin;
+    [content addSubview:self.encodingPopup];
+
+    self.hashCheck = [[NSButton alloc] initWithFrame:NSMakeRect(220, 282, 110, 18)];
+    [self.hashCheck setButtonType:NSButtonTypeSwitch];
+    self.hashCheck.title = @"Hash SHA-256";
+    self.hashCheck.state = self.hashEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    self.hashCheck.font = [NSFont systemFontOfSize:11];
+    self.hashCheck.target = self;
+    self.hashCheck.action = @selector(hashToggled:);
+    self.hashCheck.toolTip = @"Hash raw bytes with SHA-256 then encode → always 32 bytes (Base62 43 chars). Use for massive card data or fixed-length passwords.";
+    self.hashCheck.autoresizingMask = NSViewMaxYMargin;
+    [content addSubview:self.hashCheck];
+
+    NSTextField *truncLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(340, 282, 42, 14)];
+    truncLabel.stringValue = @"Truncate:";
+    truncLabel.font = [NSFont systemFontOfSize:11];
+    truncLabel.textColor = [NSColor secondaryLabelColor];
+    truncLabel.bezeled = NO; truncLabel.drawsBackground = NO; truncLabel.editable = NO; truncLabel.selectable = NO;
+    truncLabel.autoresizingMask = NSViewMaxYMargin;
+    [content addSubview:truncLabel];
+
+    self.truncateField = [[NSTextField alloc] initWithFrame:NSMakeRect(385, 278, 44, 22)];
+    self.truncateField.stringValue = self.truncateLength > 0 ? [NSString stringWithFormat:@"%ld", (long)self.truncateLength] : @"";
+    self.truncateField.placeholderString = @"e.g. 24";
+    self.truncateField.font = [NSFont systemFontOfSize:11];
+    self.truncateField.bezeled = YES; self.truncateField.bezeled = YES;
+    self.truncateField.target = self;
+    self.truncateField.action = @selector(truncateChanged:);
+    self.truncateField.toolTip = @"Truncate password to N chars (leave empty for full length). For hashed Base62, 16-24 chars is secure.";
+    self.truncateField.autoresizingMask = NSViewMaxYMargin;
+    // Send action on end editing
+    [self.truncateField setDelegate:(id<NSTextFieldDelegate>)self];
+    [content addSubview:self.truncateField];
+
+    self.truncateStepper = [[NSStepper alloc] initWithFrame:NSMakeRect(430, 278, 19, 22)];
+    self.truncateStepper.minValue = 0; self.truncateStepper.maxValue = 128; self.truncateStepper.increment = 1;
+    self.truncateStepper.valueWraps = NO;
+    self.truncateStepper.doubleValue = self.truncateLength;
+    self.truncateStepper.target = self;
+    self.truncateStepper.action = @selector(truncateChanged:);
+    self.truncateStepper.autoresizingMask = NSViewMaxYMargin;
+    [content addSubview:self.truncateStepper];
+
+    self.encodingInfoLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(455, 282, 50, 14)];
+    self.encodingInfoLabel.stringValue = @"";
+    self.encodingInfoLabel.font = [NSFont systemFontOfSize:10];
+    self.encodingInfoLabel.textColor = [NSColor secondaryLabelColor];
+    self.encodingInfoLabel.bezeled = NO; self.encodingInfoLabel.drawsBackground = NO; self.encodingInfoLabel.editable = NO; self.encodingInfoLabel.selectable = NO;
+    self.encodingInfoLabel.autoresizingMask = NSViewMaxYMargin;
+    [content addSubview:self.encodingInfoLabel];
+
+    NSTextField *hexLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 260, 200, 14)];
+    hexLabel.stringValue = @"Card Data (password)";
     hexLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
     hexLabel.textColor = [NSColor labelColor];
     hexLabel.bezeled = NO; hexLabel.drawsBackground = NO; hexLabel.editable = NO; hexLabel.selectable = NO;
     hexLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:hexLabel];
 
-     NSTextField *hexHint = [[NSTextField alloc] initWithFrame:NSMakeRect(130, 224, 300, 12)];
+    NSTextField *hexHint = [[NSTextField alloc] initWithFrame:NSMakeRect(140, 260, 360, 12)];
     hexHint.stringValue = @"— copied to clipboard, auto-type is optional (needs Device Control)";
     hexHint.font = [NSFont systemFontOfSize:10];
     hexHint.textColor = [NSColor secondaryLabelColor];
@@ -432,7 +668,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     hexHint.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:hexHint];
 
-    NSScrollView *hexScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 96, 488, 124)];
+    NSScrollView *hexScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 138, 488, 118)];
     hexScroll.hasVerticalScroller = YES;
     hexScroll.hasHorizontalScroller = NO;
     hexScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -453,7 +689,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     hexScroll.documentView = self.hexTextView;
     [content addSubview:hexScroll];
 
-    self.clipboardBtn = [[NSButton alloc] initWithFrame:NSMakeRect(16, 60, 150, 28)];
+    self.clipboardBtn = [[NSButton alloc] initWithFrame:NSMakeRect(16, 100, 150, 28)];
     self.clipboardBtn.title = @"Copy to Clipboard";
     self.clipboardBtn.bezelStyle = NSBezelStyleRounded;
     self.clipboardBtn.target = self;
@@ -464,7 +700,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     [self.clipboardBtn setEnabled:NO];
     [content addSubview:self.clipboardBtn];
 
-    self.typeButton = [[NSButton alloc] initWithFrame:NSMakeRect(174, 60, 158, 28)];
+    self.typeButton = [[NSButton alloc] initWithFrame:NSMakeRect(174, 100, 158, 28)];
     self.typeButton.title = @"Type into Field";
     self.typeButton.bezelStyle = NSBezelStyleRounded;
     self.typeButton.target = self;
@@ -473,7 +709,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     [self.typeButton setEnabled:NO];
     [content addSubview:self.typeButton];
 
-    self.clearButton = [[NSButton alloc] initWithFrame:NSMakeRect(340, 60, 80, 28)];
+    self.clearButton = [[NSButton alloc] initWithFrame:NSMakeRect(340, 100, 80, 28)];
     self.clearButton.title = @"Clear";
     self.clearButton.bezelStyle = NSBezelStyleRounded;
     self.clearButton.target = self;
@@ -481,7 +717,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     self.clearButton.autoresizingMask = NSViewMaxYMargin | NSViewMinYMargin;
     [content addSubview:self.clearButton];
 
-    NSButton *refreshBtn = [[NSButton alloc] initWithFrame:NSMakeRect(428, 60, 76, 28)];
+    NSButton *refreshBtn = [[NSButton alloc] initWithFrame:NSMakeRect(428, 100, 76, 28)];
     refreshBtn.title = @"Refresh";
     refreshBtn.bezelStyle = NSBezelStyleRounded;
     refreshBtn.target = self;
@@ -489,7 +725,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     refreshBtn.autoresizingMask = NSViewMaxYMargin | NSViewMinYMargin | NSViewMinXMargin;
     [content addSubview:refreshBtn];
 
-    self.autoCopyCheck = [[NSButton alloc] initWithFrame:NSMakeRect(16, 30, 150, 18)];
+    self.autoCopyCheck = [[NSButton alloc] initWithFrame:NSMakeRect(16, 70, 150, 18)];
     [self.autoCopyCheck setButtonType:NSButtonTypeSwitch];
     self.autoCopyCheck.title = @"Auto-copy on scan";
     self.autoCopyCheck.state = NSControlStateValueOn;
@@ -497,7 +733,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     self.autoCopyCheck.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.autoCopyCheck];
 
-    self.autoTypeCheck = [[NSButton alloc] initWithFrame:NSMakeRect(180, 30, 170, 18)];
+    self.autoTypeCheck = [[NSButton alloc] initWithFrame:NSMakeRect(180, 70, 170, 18)];
     [self.autoTypeCheck setButtonType:NSButtonTypeSwitch];
     self.autoTypeCheck.title = @"Auto-type into active field";
     self.autoTypeCheck.state = NSControlStateValueOn;
@@ -507,7 +743,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     self.autoTypeCheck.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.autoTypeCheck];
 
-    NSTextField *delayHint = [[NSTextField alloc] initWithFrame:NSMakeRect(360, 30, 144, 14)];
+    NSTextField *delayHint = [[NSTextField alloc] initWithFrame:NSMakeRect(360, 70, 144, 14)];
     delayHint.stringValue = @"1s delay before typing";
     delayHint.font = [NSFont systemFontOfSize:10];
     delayHint.textColor = [NSColor secondaryLabelColor];
@@ -532,7 +768,7 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     }
     [content addSubview:coffeeLink];
 
-    NSBox *bottomSep = [[NSBox alloc] initWithFrame:NSMakeRect(0, 52, 520, 1)];
+    NSBox *bottomSep = [[NSBox alloc] initWithFrame:NSMakeRect(0, 90, 520, 1)];
     bottomSep.boxType = NSBoxSeparator;
     bottomSep.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     [content addSubview:bottomSep];
@@ -801,10 +1037,18 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     if (result.success) {
         NSString *hex = [NSString stringWithUTF8String:result.hex_data];
         if (!hex) hex = @"";
-        self.lastHex = hex;
+        // Store raw bytes for encoding/hashing pipeline. Hex is base16 of raw bytes.
+        NSData *raw = dataFromHexString(hex);
+        if (!raw) {
+            // Fallback: treat hex string bytes as raw if decoding fails
+            raw = [hex dataUsingEncoding:NSUTF8StringEncoding];
+        }
+        self.lastRawData = raw;
+        self.lastHex = hex; // keep original for reference; transformed shown in view
         self.lastAtrHex = hexForAtr((unsigned char*)"",0); // not used
 
-        self.hexTextView.string = hex;
+        // Compute transformed password and show it (Base62/hash/truncate)
+        [self updateTransformedDisplay];
         self.hexTextView.textColor = [NSColor labelColor];
         self.statusLabel.stringValue = [NSString stringWithFormat:@"Card read ✓  (%@)", name];
         self.statusLabel.textColor = [NSColor systemGreenColor];
@@ -823,13 +1067,14 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
         self.clipboardBtn.enabled = YES;
         self.typeButton.enabled = YES;
 
+        NSString *transformed = [self currentTransformedString];
         if (self.autoCopyCheck.state == NSControlStateValueOn) {
-            copyToClipboard([hex UTF8String]);
-            NSLog(@"Auto-copied %@ chars to clipboard", @(hex.length));
+            copyToClipboard([transformed UTF8String]);
+            NSLog(@"Auto-copied %lu chars (raw %lu hex) via enc %ld hash:%@ trunc:%ld", (unsigned long)transformed.length, (unsigned long)hex.length, (long)self.selectedEncoding, self.hashEnabled?@"YES":@"NO", (long)self.truncateLength);
         }
 
         BOOL autoType = (self.autoTypeCheck.state == NSControlStateValueOn);
-        if (autoType && hex.length > 0) {
+        if (autoType && transformed.length > 0) {
             // Auto-type is optional — clipboard already done. If not trusted we
             // simply fall back to clipboard + manual paste, without blocking the UI.
             if (!isTrustedForTyping()) {
@@ -979,12 +1224,14 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
 
 - (void)clearHex:(id)sender {
     self.lastHex = @"";
+    self.lastRawData = nil;
     self.hexTextView.string = @"No card data yet — insert a card to read";
     self.hexTextView.textColor = [NSColor secondaryLabelColor];
     self.clipboardMenuItem.enabled = NO;
     self.typeMenuItem.enabled = NO;
     self.clipboardBtn.enabled = NO;
     self.typeButton.enabled = NO;
+    self.encodingInfoLabel.stringValue = @"";
 }
 
 - (void)toggleAutoType:(id)sender {
@@ -996,6 +1243,115 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
     }
     self.autoTypeMenuItem.title = on ? @"Auto-type on scan: ON" : @"Auto-type on scan: OFF";
     self.autoTypeMenuItem.state = on ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
+// MARK: - Encoding / Hash / Truncate controls
+- (void)encodingChanged:(id)sender {
+    self.selectedEncoding = (CPEncoding)[self.encodingPopup indexOfSelectedItem];
+    [[NSUserDefaults standardUserDefaults] setInteger:self.selectedEncoding forKey:@"CPEncoding"];
+    NSLog(@"Encoding changed to %ld (0=Hex 1=B62 2=B58 3=B64)", (long)self.selectedEncoding);
+    [self updateTransformedDisplay];
+}
+
+- (void)hashToggled:(id)sender {
+    self.hashEnabled = (self.hashCheck.state == NSControlStateValueOn);
+    [[NSUserDefaults standardUserDefaults] setBool:self.hashEnabled forKey:@"CPHashEnabled"];
+    NSLog(@"Hash %@", self.hashEnabled?@"ON (SHA-256)":@"OFF");
+    [self updateTransformedDisplay];
+}
+
+- (void)truncateChanged:(id)sender {
+    NSInteger val = 0;
+    if (sender == self.truncateStepper) {
+        val = (NSInteger)self.truncateStepper.doubleValue;
+        self.truncateField.stringValue = val > 0 ? [NSString stringWithFormat:@"%ld", (long)val] : @"";
+    } else {
+        // From text field
+        NSString *s = [self.truncateField.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (s.length == 0) val = 0;
+        else val = [s integerValue];
+        if (val < 0) val = 0;
+        if (val > 128) val = 128;
+        self.truncateStepper.doubleValue = val;
+    }
+    self.truncateLength = val;
+    [[NSUserDefaults standardUserDefaults] setInteger:self.truncateLength forKey:@"CPTruncateLength"];
+    NSLog(@"Truncate set to %ld", (long)self.truncateLength);
+    [self updateTransformedDisplay];
+}
+
+- (void)controlTextDidEndEditing:(NSNotification *)obj {
+    if (obj.object == self.truncateField) [self truncateChanged:self.truncateField];
+}
+
+- (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)commandSelector {
+    // Allow Enter to commit truncate field
+    if (control == self.truncateField && commandSelector == @selector(insertNewline:)) {
+        [self truncateChanged:self.truncateField];
+        [[control window] makeFirstResponder:nil];
+        return YES;
+    }
+    return NO;
+}
+
+- (NSString *)currentTransformedString {
+    // Uses lastRawData + current encoding/hash/truncate to produce the password
+    if (!self.lastRawData) {
+        // Fallback to hex string if no raw yet (e.g. before first read)
+        if (self.lastHex.length > 0) {
+            NSData *fallback = dataFromHexString(self.lastHex);
+            if (fallback) return transformData(fallback, self.selectedEncoding, self.hashEnabled, self.truncateLength);
+            return self.lastHex; // as-is
+        }
+        return @"";
+    }
+    return transformData(self.lastRawData, self.selectedEncoding, self.hashEnabled, self.truncateLength);
+}
+
+- (void)updateTransformedDisplay {
+    if (!self.lastRawData) {
+        // No data yet — keep placeholder until a card is read
+        if (self.lastHex.length == 0) {
+            self.hexTextView.string = @"No card data yet — insert a card to read";
+            self.hexTextView.textColor = [NSColor secondaryLabelColor];
+            self.encodingInfoLabel.stringValue = @"";
+            return;
+        }
+        // Legacy lastHex without raw — try to derive raw
+        NSData *raw = dataFromHexString(self.lastHex);
+        if (raw) self.lastRawData = raw;
+    }
+    NSString *transformed = [self currentTransformedString];
+    // Keep lastHex as the *transformed* password for copy/type
+    self.lastHex = transformed;
+    self.hexTextView.string = transformed.length > 0 ? transformed : @"(empty — check encoding settings)";
+    self.hexTextView.textColor = transformed.length > 0 ? [NSColor labelColor] : [NSColor secondaryLabelColor];
+
+    // Update info label: show e.g. "43 chars (B62+hash)" or truncated note
+    NSString *encName = @[@"Hex",@"Base62",@"Base58",@"Base64"][(NSInteger)self.selectedEncoding];
+    NSString *hashNote = self.hashEnabled ? @"+SHA256" : @"";
+    NSString *truncNote = self.truncateLength > 0 ? [NSString stringWithFormat:@" → %ld chars", (long)self.truncateLength] : @"";
+    NSString *info = @"";
+    if (self.lastRawData) {
+        NSUInteger rawLen = self.lastRawData.length;
+        if (self.hashEnabled) {
+            info = [NSString stringWithFormat:@"%lu raw → 32 hash → %lu %@%@%@", (unsigned long)rawLen, (unsigned long)transformed.length, encName, hashNote, truncNote];
+        } else {
+            info = [NSString stringWithFormat:@"%lu raw → %lu %@%@", (unsigned long)rawLen, (unsigned long)transformed.length, encName, truncNote];
+        }
+    } else {
+        info = [NSString stringWithFormat:@"%lu %@%@%@", (unsigned long)transformed.length, encName, hashNote, truncNote];
+    }
+    self.encodingInfoLabel.stringValue = info;
+
+    // Enable copy/type if we have something to copy
+    BOOL has = transformed.length > 0;
+    self.clipboardMenuItem.enabled = has;
+    self.typeMenuItem.enabled = has;
+    self.clipboardBtn.enabled = has;
+    self.typeButton.enabled = has;
+
+    // Persist already done in the control handlers
 }
 
 - (void)showWindowAction:(id)sender {
