@@ -53,5 +53,4 @@ deprecated/
 *.env
 *.secret
 
-# Library central copy — not part of repo
-# /Volumes/Mac Stick/Library/CardPass is outside the repo by design
+# Library central copy — not part of repo (centralized Library location outside repo)

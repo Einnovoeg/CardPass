@@ -368,9 +368,45 @@ int pcsc_init(void) {
 void pcsc_cleanup(void) {}
 
 /**
+ * Helper: try to obtain ATR for `reader_name` without requiring an active card handle.
+ * Uses SCardGetStatusChange to fetch `rgbAtr`/`cbAtr` even when SCardConnect fails
+ * (common for SD readers or exclusive-access readers like Generic USB2.0-CRW).
+ * Returns 1 if ATR obtained, 0 otherwise.
+ */
+static int get_atr_via_status(const char *reader_name, BYTE *out, DWORD *outLen) {
+    if (!reader_name || !out || !outLen) return 0;
+    SCARDCONTEXT ctx2 = 0;
+    LONG rv2 = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx2);
+    if (rv2 != SCARD_S_SUCCESS) return 0;
+    SCARD_READERSTATE rs;
+    memset(&rs, 0, sizeof(rs));
+    rs.szReader = reader_name;
+    rs.dwCurrentState = SCARD_STATE_UNAWARE;
+    // Use 500ms to allow slow readers (e.g., contact SD/banking) to report ATR.
+    rv2 = SCardGetStatusChange(ctx2, 500, &rs, 1);
+    int ok = 0;
+    if ((rv2 == SCARD_S_SUCCESS || rv2 == SCARD_E_TIMEOUT) && (rs.dwEventState & SCARD_STATE_PRESENT)) {
+        if (rs.cbAtr > 0 && rs.cbAtr <= 32) {
+            *outLen = rs.cbAtr;
+            memcpy(out, rs.rgbAtr, rs.cbAtr);
+            ok = 1;
+        }
+    }
+    SCardReleaseContext(ctx2);
+    return ok;
+}
+
+/**
  * Read hex data from `reader_name`. Tries UID -> AID/READ -> SIM/EF -> ATR
  * in order. Each step allocates its own context/handle so thread safety is
  * not a concern. Returns CardReadResult with success or error.
+ *
+ * Robustness for diverse readers (2.0.1):
+ *  - Tries multiple share modes (SHARED → EXCLUSIVE → DIRECT) and protocol combos
+ *    (T0|T1 → T0 → T1 → RAW) to handle readers that reject SHARED (e.g., Generic
+ *    USB2.0-CRW returns 0x80100066 / SCARD_W_RESET_CARD on SHARED).
+ *  - If every SCardConnect fails, falls back to ATR via SCardGetStatusChange
+ *    without a handle — guarantees stable hex for any present card.
  */
 CardReadResult pcsc_read_card(const char *reader_name) {
     CardReadResult result = {0};
@@ -392,12 +428,46 @@ CardReadResult pcsc_read_card(const char *reader_name) {
 
     SCARDHANDLE hCard = 0;
     DWORD activeProto = 0;
-    // SCARD_SHARE_SHARED lets other apps (e.g., CryptoTokenKit) keep the reader too.
-    rv = SCardConnect(ctx, reader_name, SCARD_SHARE_SHARED,
-                       SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1,
-                       &hCard, &activeProto);
-    if (rv != SCARD_S_SUCCESS) {
-        snprintf(result.error, sizeof(result.error), "Connect failed: 0x%08lX", (unsigned long)rv);
+    LONG lastConnectRv = SCARD_S_SUCCESS;
+    // Try multiple share-mode / protocol combos for reader compatibility.
+    // Order matters: SHARED with T0|T1 first (fast path for Identive, YubiKey).
+    const DWORD shareModes[] = { SCARD_SHARE_SHARED, SCARD_SHARE_EXCLUSIVE, SCARD_SHARE_DIRECT };
+    const DWORD protos[] = { SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1, SCARD_PROTOCOL_T0, SCARD_PROTOCOL_T1, SCARD_PROTOCOL_RAW };
+    int connected = 0;
+    for (size_t si = 0; si < sizeof(shareModes)/sizeof(shareModes[0]) && !connected; si++) {
+        for (size_t pi = 0; pi < sizeof(protos)/sizeof(protos[0]) && !connected; pi++) {
+            // DIRECT only makes sense with RAW or T0|T1
+            if (shareModes[si] == SCARD_SHARE_DIRECT && protos[pi] == (SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1)) {
+                // keep as is; some drivers allow DIRECT with T0|T1
+            }
+            rv = SCardConnect(ctx, reader_name, shareModes[si], protos[pi], &hCard, &activeProto);
+            if (rv == SCARD_S_SUCCESS) {
+                connected = 1;
+                lastConnectRv = rv;
+            } else {
+                // Remember last error for diagnostics
+                lastConnectRv = rv;
+                // For W_UNPOWERED / W_RESET, try a reconnect after brief delay on same mode
+                if (rv == SCARD_W_UNPOWERED_CARD || rv == SCARD_W_RESET_CARD || rv == (LONG)0x80100066 || rv == (LONG)0x80100067) {
+                    // Give reader a moment to power up
+                    // Note: no sleep here to keep UI snappy; caller may retry via polling.
+                }
+                // For SHARING_VIOLATION, next share mode may succeed
+            }
+        }
+    }
+    if (!connected) {
+        // As last resort, try ATR without handle — works for readers that expose ATR
+        // via GetStatusChange but reject SCardConnect (e.g., Generic USB2.0-CRW SD bridges).
+        BYTE atrFallback[33];
+        DWORD atrLen = 0;
+        if (get_atr_via_status(reader_name, atrFallback, &atrLen) && atrLen > 0) {
+            bytes_to_hex(atrFallback, atrLen, result.hex_data, sizeof(result.hex_data));
+            result.success = 1;
+            SCardReleaseContext(ctx);
+            return result;
+        }
+        snprintf(result.error, sizeof(result.error), "Connect failed: 0x%08lX (tried SHARED/EXCLUSIVE/DIRECT with T0/T1/RAW)", (unsigned long)lastConnectRv);
         SCardReleaseContext(ctx);
         return result;
     }
@@ -495,6 +565,8 @@ int pcsc_list_readers(ReaderList *list) {
     list->reader_count = count;
 
     // Enrich with card-present + ATR via SCardGetStatusChange
+    // 500ms accommodates slower contact readers (Generic USB2.0-CRW, Omnikey, etc.)
+    // that need time to power and report ATR; still handles TIMEOUT as success.
     if (count > 0) {
         SCARD_READERSTATE *states = calloc(count, sizeof(SCARD_READERSTATE));
         if (states) {
@@ -502,8 +574,8 @@ int pcsc_list_readers(ReaderList *list) {
                 states[i].szReader = list->readers[i].name; // stable copy
                 states[i].dwCurrentState = SCARD_STATE_UNAWARE;
             }
-            // 250ms is responsive yet light on CPU; handle TIMEOUT as success with stale data
-            rv = SCardGetStatusChange(ctx, 250, states, count);
+            // 500ms balances responsiveness and slow-reader compatibility
+            rv = SCardGetStatusChange(ctx, 500, states, count);
             if (rv == SCARD_S_SUCCESS || rv == SCARD_E_TIMEOUT) {
                 for (int i = 0; i < count; i++) {
                     list->readers[i].event_state = states[i].dwEventState;

@@ -20,6 +20,10 @@ app: $(OUT)
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp $(OUT) $(APP)/Contents/MacOS/
 	cp Resources/AppIcon.icns $(APP)/Contents/Resources/ 2>/dev/null || cp AppIcon.icns $(APP)/Contents/Resources/ 2>/dev/null || true
+	cp Resources/icon.png $(APP)/Contents/Resources/ 2>/dev/null || true
+	cp Resources/icon_256.png $(APP)/Contents/Resources/ 2>/dev/null || true
+	cp Resources/MenuIcon.png $(APP)/Contents/Resources/ 2>/dev/null || true
+	cp Resources/MenuIcon@2x.png $(APP)/Contents/Resources/ 2>/dev/null || true
 	cp Info.plist $(APP)/Contents/ 2>/dev/null || cp CardPass.app/Contents/Info.plist $(APP)/Contents/ 2>/dev/null || true
 	codesign --force --deep --sign - $(APP) || true
 
