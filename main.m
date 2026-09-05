@@ -609,10 +609,14 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
 @property (strong, nonatomic) NSButton *autoCopyCheck;
 @property (strong, nonatomic) NSProgressIndicator *spinner;
 @property (strong, nonatomic) NSTextField *readerCountLabel;
+@property (strong, nonatomic) NSPopUpButton *readerPopup;
+@property (copy, nonatomic) NSString *selectedReaderName;
 
 @property (strong, nonatomic) NSString *lastHex;
 @property (strong, nonatomic) NSString *lastAtrHex;
 @property (strong, nonatomic) NSMutableDictionary<NSString*, NSString*> *lastAtrByReader;
+@property (strong, nonatomic) NSMutableDictionary<NSString*, NSData*> *rawDataByReader; // per-reader cache for UI sync on selection
+@property (strong, nonatomic) NSMutableDictionary<NSString*, NSString*> *hexByReader; // per-reader hex cache
 @property (assign, nonatomic) BOOL isReading;
 @property (strong, nonatomic) NSTimer *pollTimer;
 @property (assign, nonatomic) int knownReaderCount;
@@ -663,6 +667,7 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
 - (void)openBuyMeACoffee:(id)sender;
 - (void)showRawHexPanel:(id)sender;
 - (void)frontmostAppChanged:(NSNotification *)note;
+- (void)readerSelectionChanged:(id)sender;
 - (void)encodingChanged:(id)sender;
 - (void)hashToggled:(id)sender;
 - (void)truncateChanged:(id)sender;
@@ -681,6 +686,8 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     _lastHex = @"";
     _lastAtrHex = @"";
     _lastAtrByReader = [NSMutableDictionary dictionary];
+    _rawDataByReader = [NSMutableDictionary dictionary];
+    _hexByReader = [NSMutableDictionary dictionary];
     _isReading = NO;
     _knownReaderCount = 0;
     _lastRawData = nil;
@@ -712,6 +719,8 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     double savedDelay = [defaults doubleForKey:@"CPAutoTypeDelay"];
     if (savedDelay >= 0.2 && savedDelay <= 10.0) _autoTypeDelay = savedDelay;
     _advancedVisible = [defaults boolForKey:@"CPAdvancedVisible"];
+    NSString *savedReader = [defaults stringForKey:@"CPSelectedReader"];
+    if (savedReader && savedReader.length > 0) _selectedReaderName = [savedReader copy];
 
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp activateIgnoringOtherApps:YES];
@@ -937,6 +946,20 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     self.readerCountLabel.bezeled = NO; self.readerCountLabel.drawsBackground = NO; self.readerCountLabel.editable = NO; self.readerCountLabel.selectable = NO;
     self.readerCountLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.readerCountLabel];
+
+    // Reader selection dropdown — only visible when 2+ readers (per bug #1 fix)
+    self.readerPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(260, 363, 200, 22) pullsDown:NO];
+    [self.readerPopup addItemWithTitle:@"Auto (any reader)"];
+    self.readerPopup.target = self;
+    self.readerPopup.action = @selector(readerSelectionChanged:);
+    self.readerPopup.toolTip = @"When multiple readers are plugged in, select which reader to use for password generation. Auto picks the first reader with a card.";
+    self.readerPopup.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    self.readerPopup.hidden = YES; // shown in updateUIWithReaders when count>1
+    if (self.selectedReaderName && self.selectedReaderName.length > 0) {
+        // Will be synced in updateUIWithReaders; keep title as placeholder for now
+        [self.readerPopup setTitle:self.selectedReaderName];
+    }
+    [content addSubview:self.readerPopup];
 
     // Readers box — 288..356 (68h), 9px gap below label
     NSScrollView *readersScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 288, 488, 68)];
@@ -1489,10 +1512,17 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
 
             for (int i = 0; i < count; i++) {
                 if (!list.readers[i].has_card) continue;
+                // Skip readers with no ATR — they are not smart cards (e.g., SD bridge) and will fail to read
+                if (list.readers[i].atr_len == 0) continue;
                 NSString *name = [NSString stringWithUTF8String:list.readers[i].name];
                 if (!name) continue;
+                // Respect user’s reader selection dropdown (fixes multi-reader bug: Auto vs specific)
+                if (strongSelf.selectedReaderName && strongSelf.selectedReaderName.length > 0) {
+                    if (![name isEqualToString:strongSelf.selectedReaderName]) continue;
+                }
                 NSString *atrHex = hexForAtr(list.readers[i].atr, list.readers[i].atr_len);
-                if (atrHex.length == 0) atrHex = @"(no ATR)";
+                if (atrHex.length == 0) continue; // no ATR → not a valid smart card
+                // If ATR is "(no ATR)" placeholder, skip — it will be handled as empty above
 
                 NSString *prev = strongSelf.lastAtrByReader[name];
                 BOOL isNew = (prev == nil) || ![prev isEqualToString:atrHex];
@@ -1524,19 +1554,11 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
                 }
             }
 
-            for (int i = 0; i < count; i++) {
-                if (list.readers[i].has_card) {
-                    NSString *name = [NSString stringWithUTF8String:list.readers[i].name];
-                    NSString *atrHex = hexForAtr(list.readers[i].atr, list.readers[i].atr_len);
-                    if (name && atrHex.length>0) strongSelf.lastAtrByReader[name] = atrHex;
-                } else {
-                    NSString *name = [NSString stringWithUTF8String:list.readers[i].name];
-                    if (name) {
-                        // keep last atr for a bit, but if card removed clear?
-                        // don't clear immediately to avoid re-read on reinsert same card quickly?
-                    }
-                }
-            }
+            // Do NOT immediately cache ATR for all has_card readers — only cache after successful read
+            // in readCardForReader. This allows Auto to try the next new reader if the first one fails
+            // (e.g., Generic with has_card but empty ATR should not block Identive). Previously this loop
+            // cached every has_card reader's ATR instantly, so if Generic was first new and failed, Identive's
+            // ATR was already considered 'seen' and never retried.
             // remove entries for readers that disappeared
             NSMutableSet *currentNames = [NSMutableSet set];
             for (int i=0;i<count;i++) {
@@ -1546,19 +1568,7 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
             NSArray *keys = [strongSelf.lastAtrByReader allKeys];
             for (NSString *k in keys) if (![currentNames containsObject:k]) [strongSelf.lastAtrByReader removeObjectForKey:k];
 
-            // clean up removed cards: if a reader now has no card, remove its atr to allow re-trigger
-            for (int i=0;i<count;i++) if (!list.readers[i].has_card) {
-                NSString *name = [NSString stringWithUTF8String:list.readers[i].name];
-                if (name) {
-                    // only remove if we previously marked it present and now absent -> allow next insert to be new
-                    // we need to know previous has_card state; simplest: if has_card==NO, clear
-                    // This ensures re-inserted same ATR will be considered new after removal cycle
-                    // But YubiKey always present -> stays
-                }
-            }
-            // For readers with no card, we intentionally keep the ATR so that if card removed and reinserted quickly with same ATR,
-            // we still detect? Actually we need to clear when card removed.
-            // So: if has_card==NO, remove entry
+            // For readers with no card, remove entry to allow re-trigger on next insert
             for (int i=0;i<count;i++) if (!list.readers[i].has_card) {
                 NSString *name = [NSString stringWithUTF8String:list.readers[i].name];
                 if (name) [strongSelf.lastAtrByReader removeObjectForKey:name];
@@ -1618,6 +1628,40 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
             // card present but no data yet (e.g., YubiKey)
         }
     }
+    // Update reader selection dropdown for multi-reader support (fixes bug #1)
+    // Preserve selection, rebuild list, and show/hide as needed
+    {
+        NSString *prevSel = self.selectedReaderName;
+        BOOL hadSelection = (prevSel && prevSel.length > 0);
+        // Rebuild popup items: Auto + each reader name
+        [self.readerPopup removeAllItems];
+        [self.readerPopup addItemWithTitle:@"Auto (any reader)"];
+        for (int i=0; i<count; i++) {
+            NSString *name = [NSString stringWithUTF8String:list.readers[i].name];
+            if (name) [self.readerPopup addItemWithTitle:name];
+        }
+        // Restore previous selection if still present
+        if (hadSelection) {
+            NSInteger idx = [self.readerPopup indexOfItemWithTitle:prevSel];
+            if (idx != -1) {
+                [self.readerPopup selectItemAtIndex:idx];
+            } else {
+                // Reader unplugged — fall back to Auto
+                [self.readerPopup selectItemAtIndex:0];
+                self.selectedReaderName = nil;
+                [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"CPSelectedReader"];
+            }
+        } else {
+            [self.readerPopup selectItemAtIndex:0];
+        }
+        // Show dropdown only when 2+ readers; otherwise hide to keep single-reader UI clean
+        self.readerPopup.hidden = (count < 2);
+        // If user has explicitly selected a reader, reflect it
+        if (self.selectedReaderName) {
+            NSInteger selIdx = [self.readerPopup indexOfItemWithTitle:self.selectedReaderName];
+            if (selIdx != -1) [self.readerPopup selectItemAtIndex:selIdx];
+        }
+    }
     self.readersTextView.string = txt;
 }
 
@@ -1633,7 +1677,11 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
             __strong typeof(weakSelf) s = weakSelf;
             if (!s) return;
             [s handleCardReadResult:result readerName:readerCopy];
-            if (atrCopy.length>0) s.lastAtrByReader[readerCopy] = atrCopy;
+            // Only cache ATR on success — on failure we keep previous to allow retry
+            // (per-reader hex/raw already cached inside handleCardReadResult on success)
+            if (result.success && atrCopy.length>0) {
+                s.lastAtrByReader[readerCopy] = atrCopy;
+            }
             s.isReading = NO;
             [s.spinner stopAnimation:nil];
         });
@@ -1655,6 +1703,13 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
         self.currentCardId = hex; // hex is the raw hex from card
         self.lastHex = hex; // keep original for reference; transformed shown in view
         self.lastAtrHex = hexForAtr((unsigned char*)"",0); // not used
+        // Per-reader cache for UI sync when switching readers via dropdown
+        if (name) {
+            if (raw) self.rawDataByReader[name] = raw;
+            if (hex) self.hexByReader[name] = hex;
+            // Also cache ATR for dedup (already done in readCardForReader on success, but ensure here)
+            if (hex.length > 0) self.lastAtrByReader[name] = hex;
+        }
 
         // If user set a custom text for this card, populate the advanced field
         NSString *custom = [self customTextForCardId:self.currentCardId];
@@ -1731,23 +1786,18 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
                 if (!toPaste || toPaste.length==0) toPaste = [self currentTransformedString];
                 if (!toPaste || toPaste.length==0) toPaste = self.lastHex;
                 NSLog(@"Auto-type attempting robust paste for %lu chars (custom:%@) to front app %@", (unsigned long)toPaste.length, [self customTextForCardId:self.currentCardId] ? @"YES" : @"NO", prevFront.localizedName ?: @"unknown");
-                // Hide CardPass briefly so the target field regains focus, then paste
-                BOOL wasVisible = self.mainWindow.isVisible;
-                if (wasVisible) [self.mainWindow orderOut:nil];
-                // Also ensure pasteboard is set
+                // Keep CardPass window visible in background — don't hide (fixes bug #2 where window disappeared/reappeared)
+                // Previously we did [mainWindow orderOut:] which caused the window to vanish and then pop back behind.
+                // Now we simply keep it visible and just activate the target app; CardPass will naturally go behind.
                 copyToClipboard([toPaste UTF8String]);
                 // Give system time to focus previous app
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    // Try to activate the previous frontmost app
+                    // Try to activate the previous frontmost app without hiding CardPass
                     if (prevFront) [prevFront activateWithOptions:NSApplicationActivateIgnoringOtherApps];
                     usleep(200000);
                     typeString([toPaste UTF8String]);
-                    // Restore CardPass window if it was visible
-                    if (wasVisible) {
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                            [self.mainWindow makeKeyAndOrderFront:nil];
-                        });
-                    }
+                    // Do NOT automatically bring CardPass back to front — let it stay behind target app.
+                    // User can click Dock/menu to bring it forward. This prevents the "moves to background" flicker.
                 });
                 // Assume paste was attempted; show success and return to Ready.
                 // If the user sees nothing pasted, they can still press ⌘V (clipboard is set).
@@ -1796,6 +1846,12 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
                 if (raw) self.lastRawData = raw;
                 self.currentCardId = hex;
                 self.lastHex = hex;
+                // Per-reader cache for UI sync
+                if (name) {
+                    if (raw) self.rawDataByReader[name] = raw;
+                    if (hex) self.hexByReader[name] = hex;
+                    self.lastAtrByReader[name] = hex;
+                }
                 [self updateTransformedDisplay];
                 self.hexTextView.textColor = [NSColor systemOrangeColor];
                 self.statusLabel.stringValue = [NSString stringWithFormat:@"Card ATR ✓  (%@)", name];
@@ -1880,36 +1936,20 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
             }
         }
     }
-    NSLog(@"Manual Type: will paste to %@ (pid %d) after hiding CardPass", prevFront.localizedName ?: @"unknown", prevFront.processIdentifier);
+    NSLog(@"Manual Type: will paste to %@ (pid %d) (keeping CardPass visible)", prevFront.localizedName ?: @"unknown", prevFront.processIdentifier);
     self.statusLabel.stringValue = @"Typing...";
     self.statusLabel.textColor = [NSColor systemBlueColor];
     if (self.statusButton) self.statusButton.title = @" Typing...";
-    BOOL wasVisible = self.mainWindow.isVisible;
-    if (wasVisible) [self.mainWindow orderOut:nil];
-    BOOL advWasVisible = self.advancedWindow.isVisible;
-    if (advWasVisible) [self.advancedWindow orderOut:nil];
+    // Keep CardPass windows visible in background — don't hide (fixes bug #2 where window disappeared/reappeared)
+    // Previously we did orderOut/mainWindow which caused the window to vanish.
+    // Now we simply activate the target app; CardPass will naturally go behind.
     // Give system time to focus previous app, then paste
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (prevFront) [prevFront activateWithOptions:NSApplicationActivateIgnoringOtherApps];
         usleep(200000);
         NSString *pasteStr = toPaste;
         typeString([pasteStr UTF8String]);
-        // Restore windows
-        // Restore windows after paste
-        if (wasVisible) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [self.mainWindow makeKeyAndOrderFront:nil];
-                if (advWasVisible) {
-                    NSRect mainFrame = self.mainWindow.frame;
-                    NSRect advFrame = self.advancedWindow.frame;
-                    advFrame.origin.x = NSMaxX(mainFrame) + 8;
-                    advFrame.origin.y = mainFrame.origin.y + (mainFrame.size.height - advFrame.size.height)/2;
-                    [self.advancedWindow setFrame:advFrame display:NO];
-                    [self.advancedWindow orderFront:nil];
-                    [self.mainWindow addChildWindow:self.advancedWindow ordered:NSWindowAbove];
-                }
-            });
-        }
+        // Do NOT automatically bring CardPass back to front — let it stay behind target app
         // Update UI to show typed
         __weak typeof(self) weakSelf2 = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -2023,6 +2063,52 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     self.autoTypeDelay = val;
     [[NSUserDefaults standardUserDefaults] setDouble:self.autoTypeDelay forKey:@"CPAutoTypeDelay"];
     NSLog(@"Delay set to %.1f s", self.autoTypeDelay);
+}
+
+- (void)readerSelectionChanged:(id)sender {
+    NSString *title = [self.readerPopup titleOfSelectedItem];
+    if ([title isEqualToString:@"Auto (any reader)"]) {
+        self.selectedReaderName = nil;
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"CPSelectedReader"];
+        NSLog(@"Reader selection: Auto (any reader)");
+        // In Auto mode, show the most recent successful read (if any) — poll will handle next card
+        // Trigger immediate poll to refresh UI for current readers
+        [self pollReaders];
+        return;
+    } else {
+        self.selectedReaderName = [title copy];
+        [[NSUserDefaults standardUserDefaults] setObject:self.selectedReaderName forKey:@"CPSelectedReader"];
+        NSLog(@"Reader selection: '%@'", self.selectedReaderName);
+    }
+    // When a specific reader is chosen, immediately reflect its card in the UI:
+    // 1) If we have cached data for that reader, show it instantly
+    NSData *cachedRaw = self.rawDataByReader[self.selectedReaderName];
+    NSString *cachedHex = self.hexByReader[self.selectedReaderName];
+    if (cachedRaw && cachedHex) {
+        NSLog(@"Reader selection: showing cached data for %@ (%lu hex)", self.selectedReaderName, (unsigned long)cachedHex.length);
+        self.lastRawData = cachedRaw;
+        self.lastHex = cachedHex;
+        self.currentCardId = cachedHex;
+        [self updateTransformedDisplay];
+        self.statusLabel.stringValue = [NSString stringWithFormat:@"Showing %@ ✓", self.selectedReaderName];
+        self.statusLabel.textColor = [NSColor systemGreenColor];
+    } else {
+        // No cached data — clear display and trigger a fresh read if card is present
+        NSLog(@"Reader selection: no cached data for %@ — will poll for card", self.selectedReaderName);
+        // Show placeholder until poll completes; poll will trigger read if has_card
+        self.hexTextView.string = [NSString stringWithFormat:@"Reader '%@' selected — insert a card to read", self.selectedReaderName];
+        self.hexTextView.textColor = [NSColor secondaryLabelColor];
+        self.encodingInfoLabel.stringValue = @"";
+        // Force immediate poll to read the selected reader without waiting 1.5s
+        [self pollReaders];
+        // Also try direct read if we know the reader has a card (via lastAtrByReader)
+        // The poll's foundNewCard logic will handle it; if ATR already cached, we need to force re-read
+        // by clearing the cached ATR for this reader so it is considered 'new'
+        [self.lastAtrByReader removeObjectForKey:self.selectedReaderName];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self pollReaders];
+        });
+    }
 }
 
 - (NSString *)customTextForCardId:(NSString *)cardId {

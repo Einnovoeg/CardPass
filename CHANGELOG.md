@@ -2,7 +2,7 @@
 
 All notable changes are documented here. Follows Keep-a-Changelog and SemVer.
 
-## [2.0.0] — 2026-09-04
+## [2.0.0] — 2026-09-05 (Updated — replaces initial 2.0.0 upload, fixes multi-reader bugs)
 
 ### Added
 - **True-black UI**: main window + Advanced pane now use `blackColor` (`0,0,0`) instead of `0.13/0.11` gray; `hexTextView` / `readersTextView` / `rawHexView` / `preTruncateView` are white-on-black with black scroll backgrounds; labels use `whiteColor` / `0.7-0.8` light gray for contrast. Tahoe `DarkAqua` retained for controls.
@@ -11,10 +11,14 @@ All notable changes are documented here. Follows Keep-a-Changelog and SemVer.
 - **Menu-bar icon**: now **black** chip (`template=NO`, size `18×18`) with inverted 5 white `*` (previously white template). `Resources/MenuIcon.png` (22) / `MenuIcon@2x.png` (44) rebuilt.
 - **Delay controls**: `delayField` + `delayStepper` (0.2–10 s, step 0.5) now properly created in window (`main.m:1184-1205`) on the Truncate row, persisted via `NSUserDefaults` (`CPAutoTypeDelay`), with delegate handling.
 - **Info label**: `encodingInfoLabel` now `9pt`, `0.65` gray, `lineBreakMode` truncate, widened to 225pt to avoid clipping.
+- **Reader selection dropdown for multi-reader** (`main.m:938-958`, `989-1025`, `1509-1524`, `2082-2100`): new `readerPopup` (`260,363,200×22`) shows when `count≥2` (hidden for single reader as requested to keep UI clean). Options: `Auto (any reader)` + each reader name; persists to `NSUserDefaults` `CPSelectedReader`; `pollInBackground` respects selection (only the chosen reader triggers `foundNewCard`). Single-reader handling unchanged.
 
 ### Fixed
 - **Jumbled / overlapping layout** (`main.m:841-1207`): rewrote `setupWindow` with clean Y-map and 8-14px gaps per row. `hexLabel` moved from `242` (which collided with `Truncate` at `238`) to `202`; `readersScroll` `288-356` (68h); Row1 `257-279` (Output/Hash); Row2 `228-250` (Truncate/Delay/Info); `hexScroll` `148-198` (50h); buttons `108`; separator `90`; toggles `60`; coffee `12`. All frames now use `NSViewMaxYMargin`/`WidthSizable` consistently; spinner moved to `480,390`. Verified via `screencapture -R` (520×502) — no overlap.
 - **Reader compatibility for diverse hardware** (`pcsc_reader.c:376-526`, `main.m:1783-1825`): `SCardConnect` now tries `SHARED` → `EXCLUSIVE` → `DIRECT` with `T0|T1` → `T0` → `T1` → `RAW` (fixes `0x80100066` `SCARD_W_RESET_CARD` on Generic USB2.0-CRW, SD bridges, and exclusive-lock readers); fallback to ATR via `SCardGetStatusChange` (500ms) without handle guarantees hex for any present card; `SCardGetStatusChange` timeout `250→500ms` for slow contact readers (Omnikey, Cherry, Feitian); `handleCardReadResult` now shows cached ATR as `Card ATR ✓` when `Connect failed` but ATR is cached, preserving auto-copy/hash.
+- **Multi-reader “No readers” bug** (`pcsc_reader.c:528-615`): `SCardListReaders` now handles `SCARD_E_INSUFFICIENT_BUFFER` race during hot-plug (reader plugged between size-query and buffer-read) with retry and larger buffer (`+2` safety, `8192` limit), handles `SCARD_E_NO_SERVICE`/`SCARD_E_SERVICE_STOPPED` with brief retry, and uses `actualDw` for parsing. Prevents “No readers — plug in a reader” when 2 readers are plugged (e.g., Identive + Generic).
+- **Multi-reader window background bug** (`main.m:1791-1803`, `1939-1948`): auto-type and manual “Type into Field” no longer hide the main/advanced windows via `orderOut:` (which caused the CardPass window to disappear and then reappear behind other apps when a second reader’s card was inserted). Now keeps windows visible in background and just activates the target app; CardPass stays behind until user clicks Dock/menu.
+- **Reader selection now syncs UI (Card Data + Advanced pane) when switching readers** (`main.m:615-640`, `1668-1705`, `1832-1868`, `2082-2125`): added per-reader caches `rawDataByReader`/`hexByReader`/`lastAtrByReader`; `handleCardReadResult` stores per-reader raw/hex; `readerSelectionChanged:` immediately shows cached data for the newly selected reader (or triggers a fresh `pollReaders` + clears `lastAtrByReader` for that reader to force re-read), and calls `updateTransformedDisplay` so `Card Data (password)` white text and `Advanced` rawHex/preTruncate views reflect the chosen reader’s card. Previously the UI stayed static after switching.
 - **PII / secrets**: removed absolute local volume paths from committed files (`main.m:43`, `README.md`, `CHANGELOG.md`, `.gitignore`); replaced with generic `~/Library/CardPass` / “centralized Library location”.
 
 ### Changed

@@ -530,29 +530,77 @@ int pcsc_list_readers(ReaderList *list) {
     memset(list, 0, sizeof(ReaderList));
     SCARDCONTEXT ctx = 0;
     LONG rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
-    if (rv != SCARD_S_SUCCESS) return 0;
+    if (rv != SCARD_S_SUCCESS) {
+        // Brief retry for SCARD_E_NO_SERVICE / SERVICE_STOPPED during hot-plug (reader just plugged)
+        if (rv == SCARD_E_NO_SERVICE || rv == (LONG)0x8010001D /* SCARD_E_SERVICE_STOPPED */) {
+            // Give pcscd a moment to restart after hotplug
+            // Use usleep via busy-wait (avoid including unistd.h just for this)
+            for (volatile int d=0; d<1000000; d++) {}
+            rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
+            if (rv != SCARD_S_SUCCESS) return 0;
+        } else {
+            return 0;
+        }
+    }
 
     DWORD dwReaders = 0;
     rv = SCardListReaders(ctx, NULL, NULL, &dwReaders);
-    if (rv != SCARD_S_SUCCESS || dwReaders == 0 || dwReaders > 4096) {
+    // Handle race where reader is plugged between calls or service just restarted
+    if (rv == SCARD_E_NO_READERS_AVAILABLE) {
         SCardReleaseContext(ctx);
-        return 0; // No readers or absurd size — treat as 0
+        return 0; // legitimately no readers
+    }
+    if (rv != SCARD_S_SUCCESS) {
+        // For INSUFFICIENT_BUFFER, dwReaders already contains needed size — retry below
+        if (rv != SCARD_E_INSUFFICIENT_BUFFER || dwReaders == 0 || dwReaders > 8192) {
+            SCardReleaseContext(ctx);
+            return 0;
+        }
+    }
+    if (dwReaders == 0 || dwReaders > 8192) {
+        SCardReleaseContext(ctx);
+        return 0; // absurd size — treat as 0
     }
 
-    char *mszReaders = malloc(dwReaders);
+    char *mszReaders = malloc(dwReaders + 2); // +2 for safety (double-null)
     if (!mszReaders) {
         SCardReleaseContext(ctx);
         return 0;
     }
+    // Ensure double-null in case of partial read
+    mszReaders[dwReaders] = '\0';
+    mszReaders[dwReaders+1] = '\0';
 
-    rv = SCardListReaders(ctx, NULL, mszReaders, &dwReaders);
+    DWORD dwReaders2 = dwReaders;
+    rv = SCardListReaders(ctx, NULL, mszReaders, &dwReaders2);
+    if (rv == SCARD_E_INSUFFICIENT_BUFFER) {
+        // Reader plugged between the two calls — buffer now too small, retry with larger size
+        free(mszReaders);
+        // dwReaders2 now contains required size
+        if (dwReaders2 == 0 || dwReaders2 > 8192) {
+            SCardReleaseContext(ctx);
+            return 0;
+        }
+        mszReaders = malloc(dwReaders2 + 2);
+        if (!mszReaders) {
+            SCardReleaseContext(ctx);
+            return 0;
+        }
+        mszReaders[dwReaders2] = '\0';
+        mszReaders[dwReaders2+1] = '\0';
+        dwReaders = dwReaders2;
+        rv = SCardListReaders(ctx, NULL, mszReaders, &dwReaders);
+    }
     if (rv != SCARD_S_SUCCESS) {
+        // SCARD_E_NO_READERS_AVAILABLE can happen transiently during hotplug; treat as 0
         free(mszReaders);
         SCardReleaseContext(ctx);
         return 0;
     }
+    // Use the actual returned size (dwReaders2 may have been updated)
+    DWORD actualDw = dwReaders2 ? dwReaders2 : dwReaders;
 
-    // Parse multi-string (double-NUL terminated)
+    // Parse multi-string (double-NUL terminated) — use actualDw which reflects bytes written
     int count = 0;
     char *ptr = mszReaders;
     while (*ptr != '\0' && count < PCSC_MAX_READERS) {
@@ -560,7 +608,9 @@ int pcsc_list_readers(ReaderList *list) {
         list->readers[count].name[PCSC_MAX_NAME_LEN - 1] = '\0';
         count++;
         ptr += strlen(ptr) + 1;
-        if ((ptr - mszReaders) >= (long)dwReaders) break;
+        if ((ptr - mszReaders) >= (long)actualDw) break;
+        // Safety: if ptr points beyond allocated buffer, stop
+        if ((ptr - mszReaders) >= (long)(actualDw + 2)) break;
     }
     list->reader_count = count;
 
