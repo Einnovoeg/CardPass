@@ -24,7 +24,7 @@
  *    - No third-party C deps. Python deps (legacy) are listed in requirements.txt.
  *
  *  Author: CardPass contributors — MIT License (see LICENSE)
- *  Support: https://buymeacoffee.com/einnovoeg
+ *  Support: Buy Me a Coffee
  */
 
 #include <stdio.h>

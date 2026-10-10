@@ -1,19 +1,19 @@
-# Third-Party Notices — CardPass 2.0
+# Third-Party Notices — CardPass 3.0.0
 
 CardPass is **MIT-licensed** (see `LICENSE`, Copyright © 2026 CardPass Contributors). It builds on Apple system frameworks and, for the legacy Python reference only, a handful of open-source packages. This file provides **full attribution** as required by each dependency's license.
 
-> **Support the project:** https://buymeacoffee.com/einnovoeg ❤️ — Buy Me a Coffee link must be preserved in docs & UI per maintainer instructions.
+> **Support the project:** Buy Me a Coffee — link preserved in docs & UI.
 
 ## Native macOS app (active, ships in releases)
 
-The released `CardPass.app` (2.0) is **pure Objective-C/C** and links **only** to Apple system frameworks. No third-party binary code is bundled.
+The released `CardPass.app` (3.0.0) is **pure Objective-C/C** and links **only** to Apple system frameworks. No third-party binary code is bundled.
 
 | Component | License | Author / Source | How we use it | Distribution note |
 |-----------|---------|-----------------|---------------|-------------------|
 | **PCSC.framework** (`PCSC/winscard.h`, `wintypes.h`) | Apple Proprietary — ships with macOS | Apple Inc. | Smart-card service via `SCardEstablishContext` / `SCardConnect` / `SCardTransmit` / `SCardStatus` / `SCardGetStatusChange`. Used in `pcsc_reader.h/c`. | Dynamic link against the user's macOS; no redistribution, no extra attribution required beyond this notice. |
 | **Cocoa / AppKit / Foundation** | Apple Proprietary — ships with macOS | Apple Inc. | UI (`NSWindow`, `NSStatusItem`, `NSTextView`, `NSPasteboard`), app lifecycle. | Dynamic, system-provided. |
 | **CoreGraphics / ApplicationServices** | Apple Proprietary — ships with macOS | Apple Inc. | Synthetic typing (`CGEventCreateKeyboardEvent`, `CGEventPost`), `AXIsProcessTrustedWithOptions`, `CGPreflightPostEventAccess` / `CGRequestPostEventAccess` (Tahoe). | Dynamic, system-provided. |
-| **CommonCrypto** (`CommonDigest.h`) | Apple Proprietary — ships with macOS | Apple Inc. | `CC_SHA256` / `CC_SHA512` / `CC_SHA1` / `CC_MD5` for hash-before-encode. | Part of system `libSystem`; dynamic. |
+| **CommonCrypto** (`CommonDigest.h`, `CommonHMAC.h`) | Apple Proprietary — ships with macOS | Apple Inc. | SHA-224/256/384/512, SHA-1, and MD5 digests; HMAC-SHA-256 streams for deterministic pseudo-random output. | Part of system `libSystem`; dynamic. |
 
 **Result:** No additional attribution or source-distribution is required at runtime for Apple frameworks beyond this notice. The app is self-contained and does not redistribute Apple binaries.
 
@@ -50,5 +50,3 @@ These packages were used **only** by the deprecated Python demos under `deprecat
 ---
 
 **Questions?** File an issue. If you contributed code under MIT and want your name listed here, open a PR.
-
-Support the project: https://buymeacoffee.com/einnovoeg ❤️

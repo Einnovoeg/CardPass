@@ -35,7 +35,7 @@
  *    - AppKit/Cocoa: Apple
  *    - Legacy Python deps (deprecated/): pyscard, pyperclip, etc. — see LICENSE for credits
  *    - Project license: MIT (see LICENSE)
- *    - Support: https://buymeacoffee.com/einnovoeg — thank you!
+ *    - Support: Buy Me a Coffee — thank you!
  *
  *  File purpose:
  *    This file holds *all* UI and integration glue. Low-level PC/SC lives in
@@ -47,6 +47,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <CommonCrypto/CommonHMAC.h>
 #import <dlfcn.h>
 
 typedef struct {
@@ -387,7 +388,8 @@ static NSString *hexForAtr(const unsigned char *atr, unsigned int len) {
 //   Base62: 0-9A-Za-z (alphanumeric, never rejected by strict fields), ~30% shorter than hex
 //   Base58: Bitcoin alphabet (no 0/O/I/l — ideal for human transcription)
 //   Base64: 0-9A-Za-z+/ with = padding, ~33% shorter than hex (may include +/)
-// Hash: SHA-256 condenses any length to 32 bytes, then Base62 → 43 chars, truncatable to 16-24
+//   Extra choices: lowercase hex, URL-safe Base64, ASCII85, and deterministic password alphabets.
+// Password modes use a card/hash-derived HMAC-SHA-256 stream, so the same card/settings reproduce the same result; they are not fresh random values on each scan.
 
 typedef NS_ENUM(NSInteger, CPEncoding) {
     CPEncodingHex = 0,   // Base16 uppercase
@@ -396,6 +398,11 @@ typedef NS_ENUM(NSInteger, CPEncoding) {
     CPEncodingBase64 = 3,
     CPEncodingBase32 = 4, // RFC4648 A-Z2-7=
     CPEncodingBase36 = 5, // 0-9A-Z
+    CPEncodingHexLower = 6,
+    CPEncodingBase64URL = 7,
+    CPEncodingASCII85 = 8,
+    CPEncodingPseudoRandom = 9,
+    CPEncodingKeyboardSymbols = 10,
 };
 
 typedef NS_ENUM(NSInteger, CPHash) {
@@ -404,7 +411,39 @@ typedef NS_ENUM(NSInteger, CPHash) {
     CPHashSHA512 = 2,
     CPHashSHA1 = 3,
     CPHashMD5 = 4,
+    CPHashSHA224 = 5,
+    CPHashSHA384 = 6,
 };
+
+static NSString *encodingName(CPEncoding encoding) {
+    switch (encoding) {
+        case CPEncodingHex: return @"Hex";
+        case CPEncodingBase62: return @"Base62";
+        case CPEncodingBase58: return @"Base58";
+        case CPEncodingBase64: return @"Base64";
+        case CPEncodingBase32: return @"Base32";
+        case CPEncodingBase36: return @"Base36";
+        case CPEncodingHexLower: return @"hex lowercase";
+        case CPEncodingBase64URL: return @"Base64 URL";
+        case CPEncodingASCII85: return @"ASCII85";
+        case CPEncodingPseudoRandom: return @"Pseudo-random";
+        case CPEncodingKeyboardSymbols: return @"Pseudo-random + symbols";
+    }
+    return @"Hex";
+}
+
+static NSString *hashName(CPHash hash) {
+    switch (hash) {
+        case CPHashSHA224: return @"SHA-224";
+        case CPHashSHA256: return @"SHA-256";
+        case CPHashSHA384: return @"SHA-384";
+        case CPHashSHA512: return @"SHA-512";
+        case CPHashSHA1: return @"SHA-1";
+        case CPHashMD5: return @"MD5";
+        case CPHashNone: return @"None";
+    }
+    return @"None";
+}
 
 static NSString *alphabetBase62(void) { return @"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"; }
 static NSString *alphabetBase58(void) { return @"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"; }
@@ -493,9 +532,7 @@ static NSString *base36EncodeData(NSData *data) { return baseEncodeData(data, al
 static NSString *base32EncodeData(NSData *data) {
     if (!data || data.length==0) return @"";
     // RFC4648 Base32 without padding, then add padding to multiple of 8
-    NSString *b64 = [data base64EncodedStringWithOptions:0];
-    // Use NSData base32 via custom? Simpler: use known Base32 alphabet via manual
-    // For now, use base64 then convert via table is complex; instead do direct Base32
+    // Encode bytes directly using the RFC4648 alphabet.
     static const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     NSMutableString *result = [NSMutableString string];
     const uint8_t *bytes = data.bytes;
@@ -520,6 +557,35 @@ static NSString *base32EncodeData(NSData *data) {
 }
 static NSString *base64EncodeData(NSData *data) { return [data base64EncodedStringWithOptions:0]; }
 
+/** RFC 4648 URL-safe Base64, with URL-unsafe characters replaced and padding removed. */
+static NSString *base64URLEncodeData(NSData *data) {
+    NSString *encoded = base64EncodeData(data);
+    encoded = [[encoded stringByReplacingOccurrencesOfString:@"+" withString:@"-"] stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+    return [encoded stringByReplacingOccurrencesOfString:@"=" withString:@""];
+}
+
+/** Adobe-style ASCII85 alphabet encoding, without framing markers or zero shorthand. */
+static NSString *ascii85EncodeData(NSData *data) {
+    if (!data || data.length == 0) return @"";
+    const uint8_t *bytes = data.bytes;
+    NSMutableString *result = [NSMutableString string];
+    for (NSUInteger offset = 0; offset < data.length; offset += 4) {
+        NSUInteger chunkLength = MIN((NSUInteger)4, data.length - offset);
+        uint32_t value = 0;
+        for (NSUInteger i = 0; i < 4; i++) {
+            value = (value << 8) | (i < chunkLength ? bytes[offset + i] : 0);
+        }
+        unichar digits[5];
+        for (NSInteger i = 4; i >= 0; i--) {
+            digits[i] = (unichar)(value % 85 + '!');
+            value /= 85;
+        }
+        NSUInteger outputLength = chunkLength == 4 ? 5 : chunkLength + 1;
+        [result appendString:[NSString stringWithCharacters:digits length:outputLength]];
+    }
+    return result;
+}
+
 static NSData *sha256Data(NSData *data) {
     if (!data) return nil;
     unsigned char hash[CC_SHA256_DIGEST_LENGTH];
@@ -528,7 +594,17 @@ static NSData *sha256Data(NSData *data) {
 }
 static NSData *hashData(NSData *data, CPHash hash) {
     if (!data) return nil;
+    if (hash == CPHashSHA224) {
+        unsigned char h[CC_SHA224_DIGEST_LENGTH];
+        CC_SHA224(data.bytes, (CC_LONG)data.length, h);
+        return [NSData dataWithBytes:h length:CC_SHA224_DIGEST_LENGTH];
+    }
     if (hash == CPHashSHA256) return sha256Data(data);
+    if (hash == CPHashSHA384) {
+        unsigned char h[CC_SHA384_DIGEST_LENGTH];
+        CC_SHA384(data.bytes, (CC_LONG)data.length, h);
+        return [NSData dataWithBytes:h length:CC_SHA384_DIGEST_LENGTH];
+    }
     if (hash == CPHashSHA512) {
         unsigned char h[CC_SHA512_DIGEST_LENGTH];
         CC_SHA512(data.bytes, (CC_LONG)data.length, h);
@@ -547,10 +623,68 @@ static NSData *hashData(NSData *data, CPHash hash) {
     return data; // None
 }
 
-/** Core transform: raw bytes -> (hash? -> raw) -> encode -> truncate.
- *  - encoding: Hex/Base62/Base58/Base64/Base32/Base36
- *  - hash: CPHashNone or SHA256/SHA512/SHA1/MD5
- *  - truncate: 0 = no truncation, else limit to N characters (clipped if shorter)
+/** Expand source data into a repeatable SHA-256 counter-mode byte stream. */
+static NSData *pseudoRandomByteStream(NSData *seed, NSUInteger length) {
+    static const uint8_t domain[] = "CardPass pseudo-random output v1";
+    NSMutableData *stream = [NSMutableData dataWithCapacity:length];
+    uint32_t counter = 0;
+    while (stream.length < length) {
+        NSMutableData *input = [NSMutableData dataWithBytes:domain length:sizeof(domain)];
+        uint8_t counterBytes[4] = {
+            (uint8_t)(counter >> 24), (uint8_t)(counter >> 16),
+            (uint8_t)(counter >> 8), (uint8_t)counter
+        };
+        [input appendBytes:counterBytes length:sizeof(counterBytes)];
+        unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+        CCHmac(kCCHmacAlgSHA256, seed.bytes, seed.length, input.bytes, input.length, digest);
+        [stream appendBytes:digest length:sizeof(digest)];
+        counter++;
+    }
+    if (stream.length > length) [stream setLength:length];
+    return stream;
+}
+
+static NSUInteger nextRandomIndex(const uint8_t *bytes, NSUInteger byteCount, NSUInteger *cursor, NSUInteger bound) {
+    if (bound == 0) return 0;
+    NSUInteger limit = 256 - (256 % bound); // rejection sampling avoids modulo bias
+    while (*cursor < byteCount) {
+        uint8_t value = bytes[(*cursor)++];
+        if (value < limit) return value % bound;
+    }
+    return 0; // The allocated stream is intentionally generous; this is only a safety fallback.
+}
+
+/** Stable per-card pseudo-random output; symbols mode guarantees at least one of each class when length permits. */
+static NSString *pseudoRandomEncodeData(NSData *seed, NSInteger requestedLength, BOOL includeSymbols) {
+    NSUInteger length = requestedLength > 0 ? (NSUInteger)requestedLength : 24;
+    length = MIN(length, (NSUInteger)128);
+    if (!seed || seed.length == 0) return @"";
+    NSString *alphabet = includeSymbols ? @"!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~" : alphabetBase62();
+    NSArray<NSString *> *requiredClasses = includeSymbols
+        ? @[@"!@#$%^&*()-_=+[]{};:,.?", @"ABCDEFGHIJKLMNOPQRSTUVWXYZ", @"abcdefghijklmnopqrstuvwxyz", @"0123456789"]
+        : @[@"ABCDEFGHIJKLMNOPQRSTUVWXYZ", @"abcdefghijklmnopqrstuvwxyz", @"0123456789"];
+    NSData *stream = pseudoRandomByteStream(seed, length * 8 + 32);
+    const uint8_t *randomBytes = stream.bytes;
+    NSUInteger cursor = 0;
+    NSMutableArray<NSString *> *characters = [NSMutableArray arrayWithCapacity:length];
+    for (NSUInteger i = 0; i < MIN(length, requiredClasses.count); i++) {
+        NSString *group = requiredClasses[i];
+        NSUInteger index = nextRandomIndex(randomBytes, stream.length, &cursor, group.length);
+        [characters addObject:[group substringWithRange:NSMakeRange(index, 1)]];
+    }
+    while (characters.count < length) {
+        NSUInteger index = nextRandomIndex(randomBytes, stream.length, &cursor, alphabet.length);
+        [characters addObject:[alphabet substringWithRange:NSMakeRange(index, 1)]];
+    }
+    for (NSUInteger i = characters.count; i > 1; i--) {
+        NSUInteger j = nextRandomIndex(randomBytes, stream.length, &cursor, i);
+        [characters exchangeObjectAtIndex:i - 1 withObjectAtIndex:j];
+    }
+    return [characters componentsJoinedByString:@""];
+}
+
+/** Core transform: raw bytes -> (optional hash) -> encoding -> truncate.
+ *  Pseudo-random modes are repeatable for the same source/hash; blank length defaults to 24.
  */
 static NSString *transformData(NSData *raw, CPEncoding encoding, CPHash hash, NSInteger truncate) {
     if (!raw) return @"";
@@ -566,14 +700,22 @@ static NSString *transformData(NSData *raw, CPEncoding encoding, CPHash hash, NS
         case CPEncodingBase64: encoded = base64EncodeData(src); break;
         case CPEncodingBase32: encoded = base32EncodeData(src); break;
         case CPEncodingBase36: encoded = base36EncodeData(src); break;
-        case CPEncodingHex:
-        default: {
+        case CPEncodingHexLower:
+        case CPEncodingHex: {
             NSMutableString *hex = [NSMutableString stringWithCapacity:src.length*2];
             const uint8_t *b = src.bytes;
-            for (NSUInteger i=0;i<src.length;i++) [hex appendFormat:@"%02X", b[i]];
+            for (NSUInteger i=0;i<src.length;i++) {
+                if (encoding == CPEncodingHexLower) [hex appendFormat:@"%02x", b[i]];
+                else [hex appendFormat:@"%02X", b[i]];
+            }
             encoded = hex;
             break;
         }
+        case CPEncodingBase64URL: encoded = base64URLEncodeData(src); break;
+        case CPEncodingASCII85: encoded = ascii85EncodeData(src); break;
+        case CPEncodingPseudoRandom: encoded = pseudoRandomEncodeData(src, truncate, NO); break;
+        case CPEncodingKeyboardSymbols: encoded = pseudoRandomEncodeData(src, truncate, YES); break;
+        default: encoded = base62EncodeData(src); break;
     }
     if (truncate > 0 && encoded.length > truncate) {
         return [encoded substringToIndex:truncate];
@@ -703,9 +845,9 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     if (!_customMappings) _customMappings = [NSMutableDictionary dictionary];
     _currentCardId = nil;
     NSInteger savedEnc = [defaults integerForKey:@"CPEncoding"];
-    if (savedEnc >= 0 && savedEnc <= 5) _selectedEncoding = (CPEncoding)savedEnc;
+    if (savedEnc >= 0 && savedEnc <= CPEncodingKeyboardSymbols) _selectedEncoding = (CPEncoding)savedEnc;
     NSInteger savedHash = [defaults integerForKey:@"CPHash"];
-    if (savedHash >= 0 && savedHash <= 4) _selectedHash = (CPHash)savedHash;
+    if (savedHash >= 0 && savedHash <= CPHashSHA384) _selectedHash = (CPHash)savedHash;
     else {
         // Backwards compat: old BOOL CPHashEnabled -> SHA256
         _hashEnabled = [defaults boolForKey:@"CPHashEnabled"];
@@ -776,7 +918,7 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     [appMenu addItem:aboutItem];
     NSMenuItem *coffeeItem = [[NSMenuItem alloc] initWithTitle:@"Support — Buy Me a Coffee ❤️" action:@selector(openBuyMeACoffee:) keyEquivalent:@""];
     coffeeItem.target = self;
-    coffeeItem.toolTip = @"Support CardPass at buymeacoffee.com/einnovoeg";
+    coffeeItem.toolTip = @"Support CardPass";
     [appMenu addItem:coffeeItem];
     [appMenu addItem:[NSMenuItem separatorItem]];
 
@@ -992,16 +1134,16 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     encLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:encLabel];
 
-    self.encodingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(66, 257, 135, 24) pullsDown:NO];
-    [self.encodingPopup addItemsWithTitles:@[@"Hex (Base16)", @"Base62 (A-Z0-9)", @"Base58 (no 0/O/I/l)", @"Base64 (+/)", @"Base32 (A-Z2-7)", @"Base36 (0-9A-Z)"]];
+    self.encodingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(66, 257, 180, 24) pullsDown:NO];
+    [self.encodingPopup addItemsWithTitles:@[@"Hex (A-F)", @"Base62", @"Base58", @"Base64", @"Base32", @"Base36", @"Hex lowercase", @"Base64 URL-safe", @"ASCII85 symbols", @"Pseudo-random", @"Pseudo-random + symbols"]];
     [self.encodingPopup selectItemAtIndex:self.selectedEncoding];
     self.encodingPopup.target = self;
     self.encodingPopup.action = @selector(encodingChanged:);
-    self.encodingPopup.toolTip = @"Base62 recommended: alphanumeric only, ~30% shorter than hex. Base58 ideal for human transcription. Base32/Base36 add more options.";
+    self.encodingPopup.toolTip = @"Choose an encoding. Pseudo-random modes are deterministic for the same card and selected hash; blank length defaults to 24. Symbol mode includes printable keyboard punctuation. This is not a password KDF or fresh random generator.";
     self.encodingPopup.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.encodingPopup];
 
-    NSTextField *hashLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(212, 262, 38, 14)];
+    NSTextField *hashLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(252, 262, 38, 14)];
     hashLabel.stringValue = @"Hash:";
     hashLabel.font = [NSFont systemFontOfSize:11];
     hashLabel.textColor = [NSColor colorWithWhite:0.8 alpha:1.0];
@@ -1009,17 +1151,19 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     hashLabel.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:hashLabel];
 
-    self.hashPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(252, 257, 105, 24) pullsDown:NO];
-    [self.hashPopup addItemsWithTitles:@[@"None", @"SHA-256", @"SHA-512", @"SHA-1", @"MD5"]];
+    self.hashPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(292, 257, 212, 24) pullsDown:NO];
+    [self.hashPopup addItemsWithTitles:@[@"None", @"SHA-256", @"SHA-512", @"SHA-1", @"MD5", @"SHA-224", @"SHA-384"]];
     NSInteger hashIdx = 0;
     if (self.selectedHash == CPHashSHA256) hashIdx = 1;
     else if (self.selectedHash == CPHashSHA512) hashIdx = 2;
     else if (self.selectedHash == CPHashSHA1) hashIdx = 3;
     else if (self.selectedHash == CPHashMD5) hashIdx = 4;
+    else if (self.selectedHash == CPHashSHA224) hashIdx = 5;
+    else if (self.selectedHash == CPHashSHA384) hashIdx = 6;
     [self.hashPopup selectItemAtIndex:hashIdx];
     self.hashPopup.target = self;
     self.hashPopup.action = @selector(hashChanged:);
-    self.hashPopup.toolTip = @"Hash raw bytes before encoding. SHA-256 → 32 bytes (Base62 43 chars), SHA-512 → 64 bytes, etc. Use for massive card data or fixed-length passwords.";
+    self.hashPopup.toolTip = @"Hash card bytes before encoding. SHA-224/256/384/512 are recommended; SHA-1 and MD5 are legacy only. A plain hash is not a password KDF.";
     self.hashPopup.autoresizingMask = NSViewMaxYMargin;
     [content addSubview:self.hashPopup];
 
@@ -1032,7 +1176,7 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
 
     // Row 2: Truncate + Delay + Info — y=228..250, 10px below Row 1
     NSTextField *truncLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 232, 58, 14)];
-    truncLabel.stringValue = @"Truncate:";
+    truncLabel.stringValue = @"Length:";
     truncLabel.font = [NSFont systemFontOfSize:11];
     truncLabel.textColor = [NSColor colorWithWhite:0.8 alpha:1.0];
     truncLabel.bezeled = NO; truncLabel.drawsBackground = NO; truncLabel.editable = NO; truncLabel.selectable = NO;
@@ -1042,12 +1186,12 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
 
     self.truncateField = [[NSTextField alloc] initWithFrame:NSMakeRect(76, 228, 44, 22)];
     self.truncateField.stringValue = self.truncateLength > 0 ? [NSString stringWithFormat:@"%ld", (long)self.truncateLength] : @"";
-    self.truncateField.placeholderString = @"e.g. 24";
+    self.truncateField.placeholderString = (self.selectedEncoding == CPEncodingPseudoRandom || self.selectedEncoding == CPEncodingKeyboardSymbols) ? @"24" : @"full";
     self.truncateField.font = [NSFont systemFontOfSize:11];
     self.truncateField.bezeled = YES;
     self.truncateField.target = self;
     self.truncateField.action = @selector(truncateChanged:);
-    self.truncateField.toolTip = @"Truncate password to N chars (leave empty for full length). For hashed Base62, 16-24 chars is secure.";
+    self.truncateField.toolTip = @"For normal encodings, limit output to N chars (blank = full result). For pseudo-random modes, this sets the generated length (blank = 24; max 128). Generated strings repeat for the same card/settings and are not a password KDF.";
     self.truncateField.autoresizingMask = NSViewMaxYMargin;
     [self.truncateField setDelegate:(id<NSTextFieldDelegate>)self];
     [content addSubview:self.truncateField];
@@ -1222,7 +1366,7 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     coffeeLink.font = [NSFont systemFontOfSize:10 weight:NSFontWeightRegular];
     coffeeLink.target = self;
     coffeeLink.action = @selector(openBuyMeACoffee:);
-    coffeeLink.toolTip = @"Support CardPass at buymeacoffee.com/einnovoeg";
+    coffeeLink.toolTip = @"Support CardPass";
     coffeeLink.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     if ([coffeeLink respondsToSelector:@selector(setButtonType:)]) {
         coffeeLink.contentTintColor = [NSColor systemPinkColor];
@@ -1362,7 +1506,7 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     [advContent addSubview:clearCustomBtn];
 
     NSTextField *advHint = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 12, 336, 20)];
-    advHint.stringValue = @"Raw Hex is the exact bytes from the card (hex). Encoded shows the result after Base62/58/64 + SHA-256 but before truncation. Main password field (left window) is the final truncated output and is intentionally compact.";
+    advHint.stringValue = @"Raw Hex is the exact bytes from the card. Encoded shows output after the selected hash and encoding, before truncation. Pseudo-random outputs are repeatable for the same card/settings (not freshly randomized). The main field shows the final output.";
     advHint.font = [NSFont systemFontOfSize:10];
     advHint.textColor = [NSColor colorWithWhite:0.6 alpha:1.0];
     advHint.bezeled = NO; advHint.drawsBackground = NO; advHint.editable = NO; advHint.selectable = NO;
@@ -1477,7 +1621,7 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
 
     NSMenuItem *coffeeStatus = [[NSMenuItem alloc] initWithTitle:@"❤️ Buy Me a Coffee" action:@selector(openBuyMeACoffee:) keyEquivalent:@""];
     coffeeStatus.target = self;
-    coffeeStatus.toolTip = @"Support the project — buymeacoffee.com/einnovoeg";
+    coffeeStatus.toolTip = @"Support the project";
     [self.statusMenu addItem:coffeeStatus];
 
     [self.statusMenu addItem:[NSMenuItem separatorItem]];
@@ -1999,8 +2143,9 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
 // MARK: - Encoding / Hash / Truncate controls
 - (void)encodingChanged:(id)sender {
     self.selectedEncoding = (CPEncoding)[self.encodingPopup indexOfSelectedItem];
+    self.truncateField.placeholderString = (self.selectedEncoding == CPEncodingPseudoRandom || self.selectedEncoding == CPEncodingKeyboardSymbols) ? @"24" : @"full";
     [[NSUserDefaults standardUserDefaults] setInteger:self.selectedEncoding forKey:@"CPEncoding"];
-    NSLog(@"Encoding changed to %ld (0=Hex 1=B62 2=B58 3=B64)", (long)self.selectedEncoding);
+    NSLog(@"Encoding changed to %ld (%@)", (long)self.selectedEncoding, encodingName(self.selectedEncoding));
     [self updateTransformedDisplay];
 }
 
@@ -2019,6 +2164,8 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     else if (idx == 2) self.selectedHash = CPHashSHA512;
     else if (idx == 3) self.selectedHash = CPHashSHA1;
     else if (idx == 4) self.selectedHash = CPHashMD5;
+    else if (idx == 5) self.selectedHash = CPHashSHA224;
+    else if (idx == 6) self.selectedHash = CPHashSHA384;
     else self.selectedHash = CPHashNone;
     self.hashEnabled = (self.selectedHash != CPHashNone);
     [[NSUserDefaults standardUserDefaults] setInteger:self.selectedHash forKey:@"CPHash"];
@@ -2325,15 +2472,21 @@ static NSString *transformDataWithBool(NSData *raw, CPEncoding enc, BOOL doHash,
     }
 
     // Update info label: show e.g. "43 chars (B62+hash)" or truncated note, plus custom note
-    NSString *encName = @[@"Hex",@"Base62",@"Base58",@"Base64"][(NSInteger)self.selectedEncoding];
-    NSString *hashNote = self.hashEnabled ? @"+SHA256" : @"";
-    NSString *truncNote = self.truncateLength > 0 ? [NSString stringWithFormat:@" → %ld chars", (long)self.truncateLength] : @"";
+    NSString *encName = encodingName(self.selectedEncoding);
+    NSString *hashNote = self.hashEnabled ? [NSString stringWithFormat:@"+%@", hashName(self.selectedHash)] : @"";
+    NSString *truncNote = self.truncateLength > 0 ? [NSString stringWithFormat:@" → %ld chars", (long)self.truncateLength] :
+        ((self.selectedEncoding == CPEncodingPseudoRandom || self.selectedEncoding == CPEncodingKeyboardSymbols) ? @" → 24 chars (default)" : @"");
     NSString *customNote = isCustom ? @" (custom)" : @"";
     NSString *info = @"";
     if (self.lastRawData) {
         NSUInteger rawLen = self.lastRawData.length;
         if (self.hashEnabled) {
-            info = [NSString stringWithFormat:@"%lu raw → 32 hash → %lu %@%@%@%@", (unsigned long)rawLen, (unsigned long)effective.length, encName, hashNote, truncNote, customNote];
+            NSUInteger digestLength = self.selectedHash == CPHashSHA224 ? CC_SHA224_DIGEST_LENGTH :
+                self.selectedHash == CPHashSHA256 ? CC_SHA256_DIGEST_LENGTH :
+                self.selectedHash == CPHashSHA384 ? CC_SHA384_DIGEST_LENGTH :
+                self.selectedHash == CPHashSHA512 ? CC_SHA512_DIGEST_LENGTH :
+                self.selectedHash == CPHashSHA1 ? CC_SHA1_DIGEST_LENGTH : CC_MD5_DIGEST_LENGTH;
+            info = [NSString stringWithFormat:@"%lu raw → %lu hash → %lu %@%@%@%@", (unsigned long)rawLen, (unsigned long)digestLength, (unsigned long)effective.length, encName, hashNote, truncNote, customNote];
         } else {
             info = [NSString stringWithFormat:@"%lu raw → %lu %@%@%@", (unsigned long)rawLen, (unsigned long)effective.length, encName, truncNote, customNote];
         }

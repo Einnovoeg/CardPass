@@ -21,7 +21,7 @@
  *
  *  Author: CardPass contributors
  *  License: MIT (see LICENSE). Third-party: PC/SC framework is part of macOS (Apple).
- *  Buy Me a Coffee: https://buymeacoffee.com/einnovoeg — support the project!
+ *  Buy Me a Coffee: support the project!
  */
 
 #ifndef PCSC_READER_H
